@@ -18,7 +18,6 @@ Nice=10
 IOSchedulingClass=idle
 
 PrivateTmp=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 NoNewPrivileges=false
 
 # Root-enabled profile: do not enable NoNewPrivileges, ProtectSystem=strict,
