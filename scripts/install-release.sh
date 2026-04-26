@@ -35,6 +35,7 @@ if [[ "${EUID}" -ne 0 ]]; then
   sudo_cmd=(sudo)
 fi
 
+"${sudo_cmd[@]}" mkdir -p "${PREFIX}/bin" "${LIBEXEC_DIR}"
 "${sudo_cmd[@]}" install -o root -g root -m 0755 "${tmp}/aiops-execd" "${PREFIX}/bin/aiops-execd"
 "${sudo_cmd[@]}" install -o root -g root -m 0755 "${tmp}/aiops-execd" "${LIBEXEC_DIR}/aiops-execd-run-child"
 "${sudo_cmd[@]}" install -o root -g root -m 0755 "${tmp}/aiops-execd" "${LIBEXEC_DIR}/aiops-execd-root-child"
