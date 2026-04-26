@@ -221,25 +221,25 @@ prefix = sys.argv[2]
 marker = sys.argv[3]
 text = path.read_text()
 lines = text.splitlines(keepends=True)
-for idx, line in enumerate(lines):
-    if line.lstrip() == marker + "\n" or line.lstrip() == marker:
-        indent = line[: len(line) - len(line.lstrip())]
-        block = (
-            f'{indent}location ^~ {prefix}/ {{\n'
-            f'{indent}    proxy_pass http://127.0.0.1:7843/;\n'
-            f'{indent}    proxy_http_version 1.1;\n'
-            f'{indent}    proxy_set_header Host $host;\n'
-            f'{indent}    proxy_set_header X-Real-IP $remote_addr;\n'
-            f'{indent}    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
-            f'{indent}    proxy_set_header X-Forwarded-Proto https;\n'
-            f'{indent}}}\n\n'
-        )
-        if "".join(lines[max(0, idx - 3): idx + 10]).find(f"location ^~ {prefix}/") != -1:
-            sys.exit(0)
-        lines.insert(idx, block)
-        break
-else:
+matches = [idx for idx, line in enumerate(lines) if line.lstrip() == marker + "\n" or line.lstrip() == marker]
+if not matches:
     raise SystemExit(f"marker not found: {marker}")
+idx = matches[-1]
+line = lines[idx]
+indent = line[: len(line) - len(line.lstrip())]
+block = (
+    f'{indent}location ^~ {prefix}/ {{\n'
+    f'{indent}    proxy_pass http://127.0.0.1:7843/;\n'
+    f'{indent}    proxy_http_version 1.1;\n'
+    f'{indent}    proxy_set_header Host $host;\n'
+    f'{indent}    proxy_set_header X-Real-IP $remote_addr;\n'
+    f'{indent}    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
+    f'{indent}    proxy_set_header X-Forwarded-Proto https;\n'
+    f'{indent}}}\n\n'
+)
+if "".join(lines[max(0, idx - 3): idx + 10]).find(f"location ^~ {prefix}/") != -1:
+    sys.exit(0)
+lines.insert(idx, block)
 text = "".join(lines)
 path.write_text(text)
 PY
