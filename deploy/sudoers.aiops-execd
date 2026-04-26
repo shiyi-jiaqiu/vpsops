@@ -1,0 +1,8 @@
+Defaults:aiopsd env_reset
+Defaults:aiopsd secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Defaults:aiopsd !setenv
+Defaults:aiopsd closefrom_override
+
+# Replace sha256 placeholders after installing the final helper binaries.
+aiopsd ALL=(aiops-run) NOPASSWD: sha256:RUN_CHILD_SHA256 /usr/local/libexec/aiops-execd-run-child ""
+aiopsd ALL=(root) NOPASSWD: sha256:ROOT_CHILD_SHA256 /usr/local/libexec/aiops-execd-root-child ""

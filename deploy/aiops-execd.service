@@ -1,0 +1,27 @@
+[Unit]
+Description=AIOps Exec API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aiopsd
+Group=aiopsd
+ExecStart=/usr/local/bin/aiops-execd -config /etc/aiops-execd/config.json
+Restart=always
+RestartSec=2s
+
+CPUQuota=30%
+MemoryHigh=256M
+TasksMax=128
+Nice=10
+IOSchedulingClass=idle
+
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# Root-enabled profile: do not enable NoNewPrivileges, ProtectSystem=strict,
+# CapabilityBoundingSet=, AmbientCapabilities=, or ProtectHome=true.
+
+[Install]
+WantedBy=multi-user.target

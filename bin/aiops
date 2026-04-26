@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+"""Small local client for aiops-execd HTTPS gateways."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_TIMEOUT = 60
+DEFAULT_WAIT = 25
+DEFAULT_TAIL = 200
+MAX_POLL_EXTRA = 30
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:/-]{0,200}$")
+
+
+@dataclass
+class HostConfig:
+    name: str
+    base: str
+    run_token: str
+    root_token: str
+    default_privilege: str
+
+
+class AiopsError(Exception):
+    pass
+
+
+class AiopsHTTPError(AiopsError):
+    def __init__(self, code: int, payload: Any):
+        self.code = code
+        self.payload = payload
+        message = payload.get("error", payload) if isinstance(payload, dict) else payload
+        super().__init__(f"HTTP {code}: {message}")
+
+
+def repo_env_path() -> Path:
+    return Path(__file__).resolve().parents[1] / ".env"
+
+
+def load_env_file(path: Path) -> dict[str, str]:
+    env: dict[str, str] = {}
+    if not path.exists():
+        return env
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        env[key] = value
+    return env
+
+
+def merged_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env_file = Path(os.environ.get("AIOPS_ENV_FILE", repo_env_path()))
+    env.update(load_env_file(env_file))
+    env["AIOPS_ENV_FILE_RESOLVED"] = str(env_file)
+    return env
+
+
+def sanitize_host(host: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", host).strip("_").upper()
+
+
+def split_csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def known_hosts(env: dict[str, str]) -> list[str]:
+    hosts: list[str] = []
+    default = env.get("AIOPS_DEFAULT_HOST", "").strip()
+    if default:
+        hosts.append(default)
+    hosts.extend(split_csv(env.get("AIOPS_HOSTS", "")))
+    return sorted(dict.fromkeys(hosts))
+
+
+def canonical_host(input_host: str, env: dict[str, str]) -> str:
+    requested = input_host.strip()
+    if requested == "default":
+        default = env.get("AIOPS_DEFAULT_HOST", "").strip()
+        if default:
+            return default
+    candidates = known_hosts(env)
+    if not candidates and env.get("AIOPS_HTTPS_BASE"):
+        return requested
+    for host in candidates:
+        if requested == host:
+            return host
+        aliases = split_csv(env.get(f"AIOPS_HOST_{sanitize_host(host)}_ALIASES", ""))
+        if requested in aliases:
+            return host
+    return requested
+
+
+def host_config(input_host: str, env: dict[str, str]) -> HostConfig:
+    host = canonical_host(input_host, env)
+    key = sanitize_host(host)
+    base = env.get(f"AIOPS_HOST_{key}_BASE")
+    run_token = env.get(f"AIOPS_HOST_{key}_RUN_TOKEN")
+    root_token = env.get(f"AIOPS_HOST_{key}_ROOT_TOKEN")
+
+    default = env.get("AIOPS_DEFAULT_HOST", "").strip()
+    aliases = split_csv(env.get(f"AIOPS_HOST_{sanitize_host(default)}_ALIASES", "")) if default else []
+    can_use_legacy = bool(env.get("AIOPS_HTTPS_BASE")) and (
+        not default or host == default or input_host in aliases or input_host == "default"
+    )
+    if can_use_legacy:
+        base = base or env.get("AIOPS_HTTPS_BASE")
+        run_token = run_token or env.get("AIOPS_RUN_TOKEN")
+        root_token = root_token or env.get("AIOPS_ROOT_TOKEN")
+
+    missing = []
+    if not base:
+        missing.append("BASE")
+    if not run_token:
+        missing.append("RUN_TOKEN")
+    if not root_token:
+        missing.append("ROOT_TOKEN")
+    if missing:
+        raise AiopsError(
+            f"host {input_host!r} is missing {', '.join(missing)} in {env.get('AIOPS_ENV_FILE_RESOLVED')}"
+        )
+
+    default_privilege = env.get(f"AIOPS_HOST_{key}_DEFAULT_PRIVILEGE") or env.get("AIOPS_DEFAULT_PRIVILEGE", "root")
+    if default_privilege not in {"root", "user"}:
+        default_privilege = "root"
+    return HostConfig(
+        name=host,
+        base=base.rstrip("/"),
+        run_token=run_token,
+        root_token=root_token,
+        default_privilege=default_privilege,
+    )
+
+
+def http_json(method: str, url: str, token: str | None = None, body: Any | None = None, timeout: int = 30) -> tuple[int, Any]:
+    headers: dict[str, str] = {}
+    data = None
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+            return resp.status, json.loads(text) if text else None
+    except urllib.error.HTTPError as exc:
+        text = exc.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            payload = {"error": text}
+        raise AiopsHTTPError(exc.code, payload) from exc
+    except urllib.error.URLError as exc:
+        raise AiopsError(f"request failed: {exc}") from exc
+
+
+def token_for(host: HostConfig, privilege: str) -> str:
+    return host.root_token if privilege == "root" else host.run_token
+
+
+def run_remote(
+    host: HostConfig,
+    req: dict[str, Any],
+    *,
+    follow: bool = True,
+    json_output: bool = False,
+    busy_retries: int = 6,
+) -> int:
+    privilege = req.get("privilege", host.default_privilege)
+    token = token_for(host, privilege)
+    status = 0
+    payload: Any = None
+    for attempt in range(max(0, busy_retries) + 1):
+        try:
+            status, payload = http_json(
+                "POST",
+                host.base + "/v1/run",
+                token,
+                req,
+                timeout=max(30, int(req["wait_sec"]) + 10),
+            )
+            break
+        except AiopsHTTPError as exc:
+            is_busy = exc.code == 409 and isinstance(exc.payload, dict) and exc.payload.get("error") == "executor is busy"
+            if not is_busy or attempt >= busy_retries:
+                raise
+            time.sleep(1)
+    if status == 202 and follow:
+        payload = poll_job(host, token, payload["job_id"], int(req["timeout_sec"]))
+    elif status == 202:
+        print(json.dumps(payload, ensure_ascii=False, indent=2) if json_output else f"job_id={payload['job_id']} state={payload['state']}")
+        return 0
+    elif isinstance(payload, dict) and payload.get("result"):
+        payload = payload["result"]
+
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        stdout = payload.get("stdout") or ""
+        stderr = payload.get("stderr") or ""
+        if stdout:
+            sys.stdout.write(stdout)
+            if not stdout.endswith("\n"):
+                sys.stdout.write("\n")
+        if stderr:
+            sys.stderr.write(stderr)
+            if not stderr.endswith("\n"):
+                sys.stderr.write("\n")
+
+    exit_code = int(payload.get("exit_code", 1))
+    state = payload.get("state", "failed")
+    if state != "succeeded" or exit_code != 0:
+        print(f"[aiops] host={host.name} job={payload.get('job_id')} state={state} exit_code={exit_code}", file=sys.stderr)
+    if exit_code == 0 and state == "succeeded":
+        return 0
+    return exit_code if 1 <= exit_code <= 125 else 1
+
+
+def poll_job(host: HostConfig, token: str, job_id: str, timeout_sec: int) -> dict[str, Any]:
+    deadline = time.time() + timeout_sec + MAX_POLL_EXTRA
+    while time.time() < deadline:
+        _, payload = http_json("GET", host.base + f"/v1/jobs/{urllib.parse.quote(job_id)}", token, timeout=30)
+        if payload.get("state") not in {"queued", "running"}:
+            return payload.get("result") or payload
+        time.sleep(1)
+    raise AiopsError(f"job {job_id} did not finish before local poll timeout")
+
+
+def base_run_request(args: argparse.Namespace, cmd: str, host: HostConfig) -> dict[str, Any]:
+    privilege = "user" if args.user else "root" if args.root else host.default_privilege
+    return {
+        "mode": "shell",
+        "cmd": cmd,
+        "privilege": privilege,
+        "cwd": args.cwd,
+        "timeout_sec": args.timeout,
+        "wait_sec": min(args.wait, args.timeout),
+        "kill_grace_sec": args.kill_grace,
+        "max_stdout_bytes": args.max_stdout_bytes,
+        "max_stderr_bytes": args.max_stderr_bytes,
+        "max_stdout_log_bytes": args.max_stdout_log_bytes,
+        "max_stderr_log_bytes": args.max_stderr_log_bytes,
+    }
+
+
+def add_run_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--root", action="store_true", help="run with the root-capable token")
+    parser.add_argument("--user", action="store_true", help="run with the unprivileged token")
+    parser.add_argument("--cwd", default="", help="remote working directory; empty uses the server default")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="remote command timeout in seconds")
+    parser.add_argument("--wait", type=int, default=DEFAULT_WAIT, help="initial HTTP wait time in seconds")
+    parser.add_argument("--kill-grace", type=int, default=3, help="SIGTERM grace period before SIGKILL")
+    parser.add_argument("--json", action="store_true", help="print the full result JSON")
+    parser.add_argument("--no-follow", action="store_true", help="do not poll async jobs")
+    parser.add_argument("--busy-retries", type=int, default=6, help="retry POST /v1/run when the host executor is busy")
+    parser.add_argument("--max-stdout-bytes", type=int, default=262144)
+    parser.add_argument("--max-stderr-bytes", type=int, default=262144)
+    parser.add_argument("--max-stdout-log-bytes", type=int, default=1048576)
+    parser.add_argument("--max-stderr-log-bytes", type=int, default=1048576)
+
+
+def parse_run(rest: list[str], host: HostConfig) -> int:
+    parser = argparse.ArgumentParser(prog="aiops <host>", description="Run a shell command through aiops-execd")
+    add_run_options(parser)
+    parser.add_argument("cmd", nargs=argparse.REMAINDER)
+    args = parser.parse_args(rest)
+    if args.root and args.user:
+        raise AiopsError("--root and --user are mutually exclusive")
+    cmd_parts = args.cmd
+    if cmd_parts and cmd_parts[0] == "--":
+        cmd_parts = cmd_parts[1:]
+    if not cmd_parts:
+        parser.error("missing command")
+    cmd = shell_command_from_parts(cmd_parts)
+    req = base_run_request(args, cmd, host)
+    return run_remote(host, req, follow=not args.no_follow, json_output=args.json, busy_retries=args.busy_retries)
+
+
+def shell_command_from_parts(cmd_parts: list[str]) -> str:
+    if len(cmd_parts) == 1:
+        return cmd_parts[0]
+    return " ".join(shlex.quote(part) for part in cmd_parts)
+
+
+def batch_script(commands: list[str], stop_on_error: bool) -> str:
+    lines = [
+        "set +e",
+        "__aiops_batch_failed=0",
+        f"__aiops_batch_stop={1 if stop_on_error else 0}",
+        "__aiops_step() {",
+        "  __idx=\"$1\"",
+        "  __cmd=\"$2\"",
+        "  printf '\\n===== aiops step %s begin =====\\n' \"$__idx\"",
+        "  printf 'cmd: %s\\n' \"$__cmd\"",
+        "  __start=$(date +%s)",
+        "  /bin/bash --noprofile --norc -o pipefail -c \"$__cmd\"",
+        "  __rc=$?",
+        "  __end=$(date +%s)",
+        "  printf '===== aiops step %s exit=%s duration_sec=%s =====\\n' \"$__idx\" \"$__rc\" \"$((__end-__start))\"",
+        "  if [ \"$__rc\" -ne 0 ]; then",
+        "    __aiops_batch_failed=\"$__rc\"",
+        "    if [ \"$__aiops_batch_stop\" = \"1\" ]; then exit \"$__rc\"; fi",
+        "  fi",
+        "}",
+    ]
+    for idx, command in enumerate(commands, 1):
+        lines.append(f"__aiops_step {idx} {shlex.quote(command)}")
+    lines.append('exit "$__aiops_batch_failed"')
+    return "\n".join(lines) + "\n"
+
+
+def read_batch_commands(args: argparse.Namespace) -> list[str]:
+    commands: list[str] = []
+    commands.extend(args.cmd or [])
+    if args.file:
+        for raw in Path(args.file).read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#"):
+                commands.append(line)
+    positional = list(args.commands or [])
+    if positional and positional[0] == "--":
+        positional = positional[1:]
+    commands.extend(positional)
+    if not commands and not sys.stdin.isatty():
+        for raw in sys.stdin.read().splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#"):
+                commands.append(line)
+    return commands
+
+
+def command_batch(host: HostConfig, rest: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="aiops <host> batch", description="Run multiple shell commands in one remote job")
+    add_run_options(parser)
+    parser.set_defaults(timeout=120)
+    parser.add_argument("--cmd", action="append", help="add one shell command; repeatable")
+    parser.add_argument("-f", "--file", help="read one shell command per non-empty non-comment line")
+    parser.add_argument("--stop-on-error", action="store_true", help="stop after the first failed step")
+    parser.add_argument("commands", nargs=argparse.REMAINDER, help="optional command strings after --")
+    args = parser.parse_args(rest)
+    if args.root and args.user:
+        raise AiopsError("--root and --user are mutually exclusive")
+    commands = read_batch_commands(args)
+    if not commands:
+        raise AiopsError("batch requires --cmd, --file, positional commands, or stdin lines")
+    script = batch_script(commands, args.stop_on_error)
+    req = base_run_request(args, script, host)
+    return run_remote(host, req, follow=not args.no_follow, json_output=args.json, busy_retries=args.busy_retries)
+
+
+def command_health(host: HostConfig) -> int:
+    _, payload = http_json("GET", host.base + "/healthz", timeout=15)
+    print(json.dumps(payload, ensure_ascii=False))
+    return 0
+
+
+def command_job(host: HostConfig, rest: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="aiops <host> job")
+    parser.add_argument("job_id")
+    parser.add_argument("--user", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(rest)
+    token = host.run_token if args.user else host.root_token
+    _, payload = http_json("GET", host.base + f"/v1/jobs/{urllib.parse.quote(args.job_id)}", token, timeout=30)
+    print(json.dumps(payload, ensure_ascii=False, indent=2) if args.json else json.dumps(payload, ensure_ascii=False))
+    return 0
+
+
+def command_output(host: HostConfig, stream: str, rest: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog=f"aiops <host> {stream}")
+    parser.add_argument("job_id")
+    parser.add_argument("--tail-bytes", type=int, default=0)
+    parser.add_argument("--user", action="store_true")
+    args = parser.parse_args(rest)
+    if args.tail_bytes < 0:
+        raise AiopsError("--tail-bytes must be non-negative")
+    token = host.run_token if args.user else host.root_token
+    url = host.base + f"/v1/jobs/{urllib.parse.quote(args.job_id)}/{stream}"
+    if args.tail_bytes:
+        url += "?tail_bytes=" + str(args.tail_bytes)
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            sys.stdout.buffer.write(resp.read())
+    except urllib.error.HTTPError as exc:
+        text = exc.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            payload = {"error": text}
+        raise AiopsHTTPError(exc.code, payload) from exc
+    except urllib.error.URLError as exc:
+        raise AiopsError(f"request failed: {exc}") from exc
+    return 0
+
+
+def quoted(value: str) -> str:
+    return shlex.quote(value)
+
+
+def require_safe_name(kind: str, value: str) -> None:
+    if not NAME_RE.match(value):
+        raise AiopsError(f"unsafe {kind}: {value!r}")
+
+
+def run_builtin(host: HostConfig, cmd: str, *, timeout: int = DEFAULT_TIMEOUT, json_output: bool = False) -> int:
+    class Args:
+        root = True
+        user = False
+        cwd = "/"
+        wait = DEFAULT_WAIT
+        kill_grace = 3
+        max_stdout_bytes = 262144
+        max_stderr_bytes = 262144
+        max_stdout_log_bytes = 1048576
+        max_stderr_log_bytes = 1048576
+
+    args = Args()
+    args.timeout = timeout
+    req = base_run_request(args, cmd, host)
+    return run_remote(host, req, follow=True, json_output=json_output)
+
+
+def command_inspect(host: HostConfig, rest: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="aiops <host> inspect")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(rest)
+    cmd = r"""set -e
+echo '## host'; hostname; uptime
+echo '## memory'; free -h
+echo '## disk'; df -h /
+echo '## docker'; docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>&1 || true
+echo '## services'; systemctl is-active aiops-execd docker nginx caddy 2>/dev/null || true
+"""
+    return run_builtin(host, cmd, timeout=30, json_output=args.json)
+
+
+def command_docker(host: HostConfig, rest: list[str]) -> int:
+    if not rest:
+        raise AiopsError("docker subcommand required: ps|logs|restart")
+    sub = rest[0]
+    if sub == "ps":
+        parser = argparse.ArgumentParser(prog="aiops <host> docker ps")
+        parser.add_argument("--all", "-a", action="store_true")
+        parser.add_argument("--json", action="store_true")
+        args = parser.parse_args(rest[1:])
+        all_flag = "-a " if args.all else ""
+        return run_builtin(host, f"docker ps {all_flag}--format 'table {{{{.Names}}}}\\t{{{{.Status}}}}\\t{{{{.Ports}}}}'", json_output=args.json)
+    if sub == "logs":
+        parser = argparse.ArgumentParser(prog="aiops <host> docker logs")
+        parser.add_argument("container")
+        parser.add_argument("--tail", type=int, default=DEFAULT_TAIL)
+        parser.add_argument("--json", action="store_true")
+        args = parser.parse_args(rest[1:])
+        require_safe_name("container", args.container)
+        return run_builtin(host, f"docker logs --tail={int(args.tail)} {quoted(args.container)} 2>&1", timeout=60, json_output=args.json)
+    if sub == "restart":
+        parser = argparse.ArgumentParser(prog="aiops <host> docker restart")
+        parser.add_argument("container")
+        parser.add_argument("--json", action="store_true")
+        args = parser.parse_args(rest[1:])
+        require_safe_name("container", args.container)
+        return run_builtin(host, f"docker restart {quoted(args.container)}", timeout=60, json_output=args.json)
+    raise AiopsError(f"unsupported docker subcommand: {sub}")
+
+
+def command_service(host: HostConfig, rest: list[str]) -> int:
+    if len(rest) < 2:
+        raise AiopsError("usage: aiops <host> service status|restart <name>")
+    action, name = rest[0], rest[1]
+    require_safe_name("service", name)
+    json_output = "--json" in rest[2:]
+    if action == "status":
+        return run_builtin(host, f"systemctl status --no-pager -l {quoted(name)}", timeout=30, json_output=json_output)
+    if action == "restart":
+        return run_builtin(host, f"systemctl restart {quoted(name)} && systemctl is-active {quoted(name)}", timeout=60, json_output=json_output)
+    raise AiopsError(f"unsupported service action: {action}")
+
+
+def command_file(host: HostConfig, rest: list[str]) -> int:
+    if len(rest) < 2 or rest[0] != "read":
+        raise AiopsError("usage: aiops <host> file read <path> [--max-bytes N] [--json]")
+    parser = argparse.ArgumentParser(prog="aiops <host> file read")
+    parser.add_argument("path")
+    parser.add_argument("--max-bytes", type=int, default=20000)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(rest[1:])
+    if not args.path.startswith("/"):
+        raise AiopsError("file path must be absolute")
+    cmd = f"test -f {quoted(args.path)} && head -c {int(args.max_bytes)} {quoted(args.path)}"
+    return run_builtin(host, cmd, timeout=30, json_output=args.json)
+
+
+def command_hosts(env: dict[str, str]) -> int:
+    hosts = known_hosts(env)
+    if not hosts and env.get("AIOPS_HTTPS_BASE"):
+        hosts = [env.get("AIOPS_DEFAULT_HOST", "default")]
+    for host in hosts:
+        aliases = split_csv(env.get(f"AIOPS_HOST_{sanitize_host(host)}_ALIASES", ""))
+        suffix = f" aliases={','.join(aliases)}" if aliases else ""
+        print(f"{host}{suffix}")
+    return 0
+
+
+def usage() -> str:
+    return """Usage:
+  aiops hosts
+  aiops <host> health
+  aiops <host> [--root|--user] [--cwd DIR] [--timeout SEC] [--json] -- <cmd>
+  aiops <host> batch --cmd <cmd> [--cmd <cmd> ...]
+  aiops <host> batch -- <cmd1> <cmd2> ...
+  aiops <host> docker ps [--all]
+  aiops <host> docker logs <container> [--tail N]
+  aiops <host> service status|restart <name>
+  aiops <host> file read <absolute-path> [--max-bytes N]
+  aiops <host> job <job_id> [--json]
+  aiops <host> stdout|stderr <job_id> [--tail-bytes N]
+"""
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in {"-h", "--help", "help"}:
+        print(usage())
+        return 0
+    env = merged_env()
+    if argv[0] == "hosts":
+        return command_hosts(env)
+    host = host_config(argv[0], env)
+    rest = argv[1:]
+    if not rest:
+        print(usage(), file=sys.stderr)
+        return 2
+    if rest[0] == "health":
+        return command_health(host)
+    if rest[0] == "inspect":
+        return command_inspect(host, rest[1:])
+    if rest[0] == "batch":
+        return command_batch(host, rest[1:])
+    if rest[0] == "docker":
+        return command_docker(host, rest[1:])
+    if rest[0] == "service":
+        return command_service(host, rest[1:])
+    if rest[0] == "file":
+        return command_file(host, rest[1:])
+    if rest[0] == "job":
+        return command_job(host, rest[1:])
+    if rest[0] in {"stdout", "stderr"}:
+        return command_output(host, rest[0], rest[1:])
+    return parse_run(rest, host)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except AiopsError as exc:
+        print(f"[aiops] {exc}", file=sys.stderr)
+        raise SystemExit(2)

@@ -1,0 +1,64 @@
+{
+  "listen": "127.0.0.1:7843",
+  "tokens": [
+    {
+      "id": "ai-run",
+      "sha256": "replace_with_sha256_of_run_token",
+      "allow_root": false
+    },
+    {
+      "id": "ai-root",
+      "sha256": "replace_with_sha256_of_root_token",
+      "allow_root": true
+    }
+  ],
+  "limits": {
+    "default_timeout_sec": 30,
+    "max_timeout_sec": 300,
+    "default_wait_sec": 25,
+    "max_wait_sec": 60,
+    "default_kill_grace_sec": 3,
+    "max_request_bytes": 131072,
+    "max_cmd_bytes": 8192,
+    "max_stdin_bytes": 65536,
+    "default_stdout_bytes": 262144,
+    "default_stderr_bytes": 262144,
+    "max_stdout_bytes": 1048576,
+    "max_stderr_bytes": 1048576,
+    "default_stdout_log_bytes": 1048576,
+    "default_stderr_log_bytes": 1048576,
+    "max_stdout_log_bytes": 16777216,
+    "max_stderr_log_bytes": 16777216,
+    "concurrency": 1,
+    "max_jobs_retained": 1000
+  },
+  "security": {
+    "auth_failure_limit": 10,
+    "auth_failure_window_sec": 60
+  },
+  "execution": {
+    "shell_path": "/bin/bash",
+    "shell_args": ["--noprofile", "--norc", "-o", "pipefail", "-c"],
+    "fixed_path": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "allow_any_cwd_for_root": true,
+    "allowed_cwd_prefixes_for_user": ["/opt", "/srv", "/var/www", "/tmp", "/var/log"],
+    "run_user": "aiops-run",
+    "root_home": "/root",
+    "run_home": "/var/lib/aiops-run"
+  },
+  "env": {
+    "allow": ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"],
+    "deny": ["LD_PRELOAD", "LD_LIBRARY_PATH", "BASH_ENV", "ENV", "GIT_SSH_COMMAND", "SSH_AUTH_SOCK", "PYTHONPATH", "NODE_OPTIONS"]
+  },
+  "storage": {
+    "job_dir": "/var/lib/aiops-execd/jobs",
+    "log_dir": "/var/log/aiops-execd",
+    "retention_days": 7,
+    "max_total_job_bytes": 104857600
+  },
+  "helpers": {
+    "sudo_path": "/usr/bin/sudo",
+    "run_child_path": "/usr/local/libexec/aiops-execd-run-child",
+    "root_child_path": "/usr/local/libexec/aiops-execd-root-child"
+  }
+}
