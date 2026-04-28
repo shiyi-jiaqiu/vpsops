@@ -17,6 +17,12 @@ This is not a sandbox. It is a controlled management channel for trusted AI tool
 - Job directories are cleaned according to `retention_days`, `max_jobs_retained`, and `max_total_job_bytes`.
 - Failed authentication attempts are throttled per TCP peer by the `security.auth_failure_*` settings.
 
+## Documentation
+
+- Repository layout: [`docs/repo-layout.md`](docs/repo-layout.md)
+- Testing policy: [`docs/testing.md`](docs/testing.md)
+- Release and deployment: [`docs/deployment.md`](docs/deployment.md)
+
 ## Build
 
 ```bash
@@ -77,6 +83,13 @@ sudo ./scripts/bootstrap-release-host.sh \
 ```
 
 The install script only installs the binary under `/usr/local/bin/aiops-execd` and the two helper copies under `/usr/local/libexec/`. You still need to create users, config, sudoers, and the systemd unit.
+
+For existing configured hosts, use the local rollout script:
+
+```bash
+./scripts/deploy-release.sh --version v0.1.0 --hosts jp,la,sg,gcp
+./scripts/deploy-release.sh --version v0.1.0 --verify-only
+```
 
 ## API
 
