@@ -1,6 +1,6 @@
 # vpsops
 
-`vpsops` is a lightweight remote exec gateway for AI-driven VPS operations. The server binary is `aiops-execd`; the local operator CLI is `bin/vpsops`; the local stdio MCP adapter is `bin/vpsops-mcp`.
+`vpsops` is a lightweight remote exec gateway for AI-driven VPS operations. The server binary is `aiops-execd`; the local operator CLI is `bin/vpsops`.
 
 `aiops-execd` accepts structured HTTP requests containing shell or argv commands, executes them with timeout and process-group cleanup, and returns structured JSON results.
 
@@ -54,16 +54,26 @@ vpsops-execd_linux_arm64.tar.gz
 checksums.txt
 ```
 
-Install the latest release binary on a VPS:
+Install a tagged release binary on a VPS from a checked-out tag:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shiyi-jiaqiu/vpsops/main/scripts/install-release.sh | sudo bash
+git clone --branch v0.1.0 --depth 1 https://github.com/shiyi-jiaqiu/vpsops.git
+cd vpsops
+sudo VERSION=v0.1.0 ./scripts/install-release.sh
 ```
 
-Install a specific tag:
+Do not pipe a mutable remote installer directly into `sudo bash`. For full host bootstrap, pass an explicit release tag:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shiyi-jiaqiu/vpsops/main/scripts/install-release.sh | sudo env VERSION=v0.1.0 bash
+sudo ./scripts/bootstrap-release-host.sh \
+  --domain exec.example.com \
+  --path /hidden-aiops-path \
+  --run-token "$AIOPS_RUN_TOKEN" \
+  --root-token "$AIOPS_ROOT_TOKEN" \
+  --proxy caddy \
+  --config-path /etc/caddy/Caddyfile \
+  --marker '# aiops-execd marker' \
+  --version v0.1.0
 ```
 
 The install script only installs the binary under `/usr/local/bin/aiops-execd` and the two helper copies under `/usr/local/libexec/`. You still need to create users, config, sudoers, and the systemd unit.
@@ -107,31 +117,37 @@ curl -sS 'http://127.0.0.1:7843/v1/jobs/JOB_ID/stdout?tail_bytes=65536' \
 
 ## Local CLI
 
-Use the local wrapper when operating a configured host. It reads `.env` from this repo root, hides the HTTPS/token details, and calls the existing `/v1/run` API. `bin/vpsops` is a stable alias for the same CLI; examples below keep `aiops` for compatibility.
+Use `vpsops` as the human-facing CLI. It reads `.env` from this repo root, hides the HTTPS/token details, and calls the existing `/v1/run` API.
 
 ```bash
 cp .env.example .env
-bin/aiops hosts
-bin/aiops example health
-bin/aiops example -- hostname
-bin/aiops example --user -- id -un
-bin/aiops example batch --cmd 'hostname' --cmd 'uptime' --cmd 'df -h /'
-bin/aiops example docker ps
-bin/aiops example service status aiops-execd
-bin/aiops example file read /etc/hostname
-bin/vpsops example -- hostname
+vpsops hosts
+vpsops jp health
+vpsops jp -- hostname
+vpsops jp --user -- id -un
+vpsops jp batch --cmd 'hostname' --cmd 'uptime' --cmd 'df -h /'
+vpsops la docker ps
+vpsops sg service status aiops-execd
+vpsops gcp file read /etc/hostname
 ```
 
-The command form is intentionally close to SSH:
+Configured host names in this workspace:
+
+- `jp`
+- `la`
+- `sg`
+- `gcp`
+
+The command form stays intentionally close to SSH:
 
 ```bash
-bin/vpsops <host> -- <shell command>
+vpsops <host> -- <shell command>
 ```
 
 For multiple independent inspection commands, prefer one batch job instead of several separate HTTP calls:
 
 ```bash
-bin/vpsops <host> batch \
+vpsops <host> batch \
   --cmd 'hostname' \
   --cmd 'uptime' \
   --cmd 'free -h' \
@@ -153,37 +169,6 @@ AIOPS_DEFAULT_PRIVILEGE=root
 AIOPS_HOST_EXAMPLE_BASE=https://example.com/hidden-aiops-path
 AIOPS_HOST_EXAMPLE_RUN_TOKEN=...
 AIOPS_HOST_EXAMPLE_ROOT_TOKEN=...
-```
-
-## Local MCP Server
-
-`bin/vpsops-mcp` starts a local stdio MCP server for AI clients. It does not expose a remote MCP listener and does not store tokens. The server delegates every operation to `bin/aiops`, so host config, token loading, busy retry, job polling, and result formatting remain centralized.
-
-The MCP intentionally stays small:
-
-- `vps_run` is the universal fallback and can run any shell command through the existing Exec API.
-- `vps_batch` runs several commands sequentially in one remote job and should be preferred for multi-step inspection.
-- `vps_hosts`, `vps_health`, and `vps_inspect` cover discovery and standard health checks.
-- `docker_ps`, `docker_logs`, `service_status`, and `file_read` are high-frequency read-only templates to reduce quoting mistakes.
-
-Example Codex config snippet:
-
-```toml
-[mcp_servers.vpsops]
-command = "/path/to/vpsops/bin/vpsops-mcp"
-args = []
-```
-
-The same snippet is stored at `mcp/codex-config.example.toml`. Existing Codex sessions may need to be restarted before the new MCP tool appears.
-
-Minimal JSON-RPC smoke test:
-
-```bash
-printf '%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"smoke","version":"0"},"capabilities":{}}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"vps_run","arguments":{"host":"example","cmd":"hostname","timeout_sec":20}}}' \
-  | bin/vpsops-mcp
 ```
 
 ## Local Smoke Test

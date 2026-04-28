@@ -187,6 +187,45 @@ func TestHandleRunReturns500ForPrepareJobInternalError(t *testing.T) {
 	}
 }
 
+func TestHandleRunReturns409ForIdempotencyConflict(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Tokens = []TokenConfig{{ID: "ai-run", SHA256: SHA256Hex("good-token")}}
+	base := t.TempDir()
+	cfg.Storage.JobDir = filepath.Join(base, "jobs")
+	cfg.Storage.LogDir = filepath.Join(base, "logs")
+	s, err := NewServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	existingReq := RunRequest{
+		Mode:           "shell",
+		Cmd:            "echo one",
+		Privilege:      PrivilegeUser,
+		Cwd:            "/tmp",
+		TimeoutSec:     5,
+		IdempotencyKey: "same",
+	}
+	if err := normalizeRequest(&existingReq, cfg); err != nil {
+		t.Fatal(err)
+	}
+	s.idempotency["ai-run:same"] = &job{
+		id:   "20260426T000000-existing",
+		hash: requestHash(existingReq),
+		done: make(chan struct{}),
+	}
+
+	body := strings.NewReader(`{"mode":"shell","cmd":"echo two","privilege":"user","cwd":"/tmp","timeout_sec":5,"idempotency_key":"same"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/run", body)
+	req.Header.Set("Authorization", "Bearer good-token")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleRun(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for idempotency conflict, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestAuthorizeJobAccessUsesMetadata(t *testing.T) {
 	s := newTestServer(t, 1)
 	req := RunRequest{
@@ -265,5 +304,21 @@ func TestWriteAuditJSONL(t *testing.T) {
 	}
 	if entry["cmd_preview"] != "echo ok" {
 		t.Fatalf("unexpected cmd preview: %#v", entry["cmd_preview"])
+	}
+}
+
+func TestClientAddressTrustsForwardedHeadersOnlyFromLoopbackPeer(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/run", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-Forwarded-For", "203.0.113.20, 127.0.0.1")
+	if got := clientAddress(req); got != "203.0.113.20" {
+		t.Fatalf("expected forwarded client from loopback proxy, got %q", got)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/run", nil)
+	req.RemoteAddr = "198.51.100.10:1234"
+	req.Header.Set("X-Forwarded-For", "203.0.113.20")
+	if got := clientAddress(req); got != "198.51.100.10" {
+		t.Fatalf("expected direct peer when non-loopback sends forwarded header, got %q", got)
 	}
 }

@@ -23,6 +23,7 @@ DEFAULT_WAIT = 25
 DEFAULT_TAIL = 200
 MAX_POLL_EXTRA = 30
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:/-]{0,200}$")
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass
@@ -50,20 +51,38 @@ def repo_env_path() -> Path:
     return Path(__file__).resolve().parents[1] / ".env"
 
 
+def parse_env_value(raw_value: str, path: Path, line_no: int) -> str:
+    value = raw_value.strip()
+    if not value:
+        return ""
+    if value[0] in {"'", '"'}:
+        try:
+            parts = shlex.split(value, comments=True, posix=True)
+        except ValueError as exc:
+            raise AiopsError(f"{path}:{line_no}: invalid quoted value: {exc}") from exc
+        if len(parts) != 1:
+            raise AiopsError(f"{path}:{line_no}: quoted env value must be a single token")
+        return parts[0]
+    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
+
+
 def load_env_file(path: Path) -> dict[str, str]:
     env: dict[str, str] = {}
     if not path.exists():
         return env
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    for line_no, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        if not line or line.startswith("#"):
             continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            raise AiopsError(f"{path}:{line_no}: expected KEY=VALUE")
         key, value = line.split("=", 1)
         key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        env[key] = value
+        if not ENV_KEY_RE.match(key):
+            raise AiopsError(f"{path}:{line_no}: invalid env key {key!r}")
+        env[key] = parse_env_value(value, path, line_no)
     return env
 
 
@@ -287,6 +306,7 @@ def parse_run(rest: list[str], host: HostConfig) -> int:
     args = parser.parse_args(rest)
     if args.root and args.user:
         raise AiopsError("--root and --user are mutually exclusive")
+    validate_run_options(args)
     cmd_parts = args.cmd
     if cmd_parts and cmd_parts[0] == "--":
         cmd_parts = cmd_parts[1:]
@@ -361,6 +381,7 @@ def command_batch(host: HostConfig, rest: list[str]) -> int:
     args = parser.parse_args(rest)
     if args.root and args.user:
         raise AiopsError("--root and --user are mutually exclusive")
+    validate_run_options(args)
     commands = read_batch_commands(args)
     if not commands:
         raise AiopsError("batch requires --cmd, --file, positional commands, or stdin lines")
@@ -393,8 +414,7 @@ def command_output(host: HostConfig, stream: str, rest: list[str]) -> int:
     parser.add_argument("--tail-bytes", type=int, default=0)
     parser.add_argument("--user", action="store_true")
     args = parser.parse_args(rest)
-    if args.tail_bytes < 0:
-        raise AiopsError("--tail-bytes must be non-negative")
+    require_int_range("--tail-bytes", args.tail_bytes, min_value=0)
     token = host.run_token if args.user else host.root_token
     url = host.base + f"/v1/jobs/{urllib.parse.quote(args.job_id)}/{stream}"
     if args.tail_bytes:
@@ -422,6 +442,27 @@ def quoted(value: str) -> str:
 def require_safe_name(kind: str, value: str) -> None:
     if not NAME_RE.match(value):
         raise AiopsError(f"unsafe {kind}: {value!r}")
+
+
+def require_int_range(name: str, value: int, *, min_value: int | None = None, max_value: int | None = None) -> None:
+    if min_value is not None and value < min_value:
+        raise AiopsError(f"{name} must be >= {min_value}")
+    if max_value is not None and value > max_value:
+        raise AiopsError(f"{name} must be <= {max_value}")
+
+
+def validate_run_options(args: argparse.Namespace) -> None:
+    require_int_range("--timeout", args.timeout, min_value=1)
+    require_int_range("--wait", args.wait, min_value=0)
+    require_int_range("--kill-grace", args.kill_grace, min_value=1, max_value=30)
+    require_int_range("--busy-retries", args.busy_retries, min_value=0)
+    for name in (
+        "max_stdout_bytes",
+        "max_stderr_bytes",
+        "max_stdout_log_bytes",
+        "max_stderr_log_bytes",
+    ):
+        require_int_range("--" + name.replace("_", "-"), int(getattr(args, name)), min_value=0)
 
 
 def run_builtin(host: HostConfig, cmd: str, *, timeout: int = DEFAULT_TIMEOUT, json_output: bool = False) -> int:
@@ -473,6 +514,7 @@ def command_docker(host: HostConfig, rest: list[str]) -> int:
         parser.add_argument("--tail", type=int, default=DEFAULT_TAIL)
         parser.add_argument("--json", action="store_true")
         args = parser.parse_args(rest[1:])
+        require_int_range("--tail", args.tail, min_value=1)
         require_safe_name("container", args.container)
         return run_builtin(host, f"docker logs --tail={int(args.tail)} {quoted(args.container)} 2>&1", timeout=60, json_output=args.json)
     if sub == "restart":
@@ -486,15 +528,23 @@ def command_docker(host: HostConfig, rest: list[str]) -> int:
 
 
 def command_service(host: HostConfig, rest: list[str]) -> int:
-    if len(rest) < 2:
+    if not rest:
         raise AiopsError("usage: aiops <host> service status|restart <name>")
-    action, name = rest[0], rest[1]
-    require_safe_name("service", name)
-    json_output = "--json" in rest[2:]
+    action = rest[0]
     if action == "status":
-        return run_builtin(host, f"systemctl status --no-pager -l {quoted(name)}", timeout=30, json_output=json_output)
+        parser = argparse.ArgumentParser(prog="aiops <host> service status")
+        parser.add_argument("name")
+        parser.add_argument("--json", action="store_true")
+        args = parser.parse_args(rest[1:])
+        require_safe_name("service", args.name)
+        return run_builtin(host, f"systemctl status --no-pager -l {quoted(args.name)}", timeout=30, json_output=args.json)
     if action == "restart":
-        return run_builtin(host, f"systemctl restart {quoted(name)} && systemctl is-active {quoted(name)}", timeout=60, json_output=json_output)
+        parser = argparse.ArgumentParser(prog="aiops <host> service restart")
+        parser.add_argument("name")
+        parser.add_argument("--json", action="store_true")
+        args = parser.parse_args(rest[1:])
+        require_safe_name("service", args.name)
+        return run_builtin(host, f"systemctl restart {quoted(args.name)} && systemctl is-active {quoted(args.name)}", timeout=60, json_output=args.json)
     raise AiopsError(f"unsupported service action: {action}")
 
 
@@ -508,6 +558,7 @@ def command_file(host: HostConfig, rest: list[str]) -> int:
     args = parser.parse_args(rest[1:])
     if not args.path.startswith("/"):
         raise AiopsError("file path must be absolute")
+    require_int_range("--max-bytes", args.max_bytes, min_value=1)
     cmd = f"test -f {quoted(args.path)} && head -c {int(args.max_bytes)} {quoted(args.path)}"
     return run_builtin(host, cmd, timeout=30, json_output=args.json)
 

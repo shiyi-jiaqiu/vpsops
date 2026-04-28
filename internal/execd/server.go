@@ -118,6 +118,10 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "lock_key is busy")
 			return
 		}
+		if errors.Is(err, errIdempotencyConflict) {
+			writeError(w, http.StatusConflict, "idempotency key reused with different request")
+			return
+		}
 		log.Printf("prepare job: %v", err)
 		writeError(w, http.StatusInternalServerError, "prepare job failed")
 		return
@@ -136,6 +140,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 
 var errBusy = errors.New("busy")
 var errLockBusy = errors.New("lock busy")
+var errIdempotencyConflict = errors.New("idempotency key reused with different request")
 
 func (s *Server) prepareJob(req RunRequest, reqHash string, auth AuthInfo, remote string) (*job, bool, error) {
 	s.mu.Lock()
@@ -144,7 +149,7 @@ func (s *Server) prepareJob(req RunRequest, reqHash string, auth AuthInfo, remot
 		key := auth.TokenID + ":" + req.IdempotencyKey
 		if existing := s.idempotency[key]; existing != nil {
 			if existing.hash != reqHash {
-				return nil, false, errors.New("idempotency key reused with different request")
+				return nil, false, errIdempotencyConflict
 			}
 			return existing, true, nil
 		}
@@ -382,20 +387,19 @@ func jobDone(j *job) bool {
 }
 
 func clientAddress(r *http.Request) string {
-	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwarded != "" {
-		if first, _, ok := strings.Cut(forwarded, ","); ok {
-			return strings.TrimSpace(first)
+	peer := peerAddress(r)
+	if isLoopbackAddress(peer) {
+		if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwarded != "" {
+			if first, _, ok := strings.Cut(forwarded, ","); ok {
+				return strings.TrimSpace(first)
+			}
+			return forwarded
 		}
-		return forwarded
+		if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
+			return realIP
+		}
 	}
-	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
-		return realIP
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
-		return host
-	}
-	return r.RemoteAddr
+	return peer
 }
 
 func peerAddress(r *http.Request) string {
@@ -404,6 +408,11 @@ func peerAddress(r *http.Request) string {
 		return host
 	}
 	return r.RemoteAddr
+}
+
+func isLoopbackAddress(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s *Server) writeAudit(j *job, req RunRequest, res RunResult) error {

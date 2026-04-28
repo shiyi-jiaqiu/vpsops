@@ -30,7 +30,7 @@ jobs:
         run: ./scripts/smoke-local.sh
 
       - name: Python syntax check
-        run: python3 -m py_compile bin/aiops mcp/vpsops_mcp.py
+        run: python3 -m py_compile bin/aiops
 
       - name: Package linux release assets
         run: VERSION="${GITHUB_REF_NAME}" ./scripts/package-release.sh

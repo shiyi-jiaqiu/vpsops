@@ -3,6 +3,7 @@ package execd
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -97,5 +98,32 @@ func TestNormalizeRequestRejectsRootFalsePrivilegeRoot(t *testing.T) {
 	}
 	if err := normalizeRequest(&req, cfg); err == nil {
 		t.Fatal("expected root=false with privilege=root to fail")
+	}
+}
+
+func TestLoadConfigRejectsUnknownFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	content := `{
+  "tokens": [
+    {"id": "ai-run", "sha256": "` + strings.Repeat("a", 64) + `", "allow_root": false}
+  ],
+  "executionn": {"allow_any_cwd_for_root": false}
+}`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("expected unknown field error, got %v", err)
+	}
+}
+
+func TestLoadConfigRejectsMultipleJSONValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	content := `{"tokens":[{"id":"ai-run","sha256":"` + strings.Repeat("a", 64) + `"}]} {}`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "multiple JSON values") {
+		t.Fatalf("expected multiple JSON values error, got %v", err)
 	}
 }

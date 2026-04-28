@@ -12,7 +12,7 @@ Usage:
     --proxy caddy|nginx \
     --config-path PATH \
     --marker STRING \
-    [--version latest|vX.Y.Z]
+    --version vX.Y.Z
 
 Installs the published aiops-execd release, writes host-specific config/sudoers,
 patches the local reverse proxy with a hidden path, and validates the deployment.
@@ -26,7 +26,8 @@ root_token=""
 proxy_kind=""
 config_path=""
 marker=""
-version="latest"
+version=""
+repo="${REPO:-shiyi-jiaqiu/vpsops}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -50,6 +51,16 @@ for required in domain path_prefix run_token root_token proxy_kind config_path m
     exit 2
   fi
 done
+if [[ -z "${version}" || "${version}" == "latest" ]]; then
+  echo "--version must be an explicit release tag such as v0.1.0" >&2
+  usage >&2
+  exit 2
+fi
+if [[ "${version}" != v* ]]; then
+  echo "--version must look like a release tag, for example v0.1.0" >&2
+  usage >&2
+  exit 2
+fi
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "run as root" >&2
@@ -60,7 +71,26 @@ export DEBIAN_FRONTEND=noninteractive
 
 mkdir -p /usr/local/bin /usr/local/libexec
 
-curl -fsSL https://raw.githubusercontent.com/shiyi-jiaqiu/vpsops/main/scripts/install-release.sh | env VERSION="${version}" bash
+tmp="$(mktemp -d)"
+trap 'rm -rf "${tmp}"' EXIT
+
+case "$(uname -m)" in
+  x86_64|amd64) arch="amd64" ;;
+  aarch64|arm64) arch="arm64" ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 2 ;;
+esac
+asset="vpsops-execd_linux_${arch}.tar.gz"
+release_base="https://github.com/${repo}/releases/download/${version}"
+curl -fsSL -o "${tmp}/${asset}" "${release_base}/${asset}"
+curl -fsSL -o "${tmp}/checksums.txt" "${release_base}/checksums.txt"
+(
+  cd "${tmp}"
+  grep -F " ${asset}" checksums.txt | sha256sum -c -
+  tar -xzf "${asset}"
+)
+install -o root -g root -m 0755 "${tmp}/aiops-execd" /usr/local/bin/aiops-execd
+install -o root -g root -m 0755 "${tmp}/aiops-execd" /usr/local/libexec/aiops-execd-run-child
+install -o root -g root -m 0755 "${tmp}/aiops-execd" /usr/local/libexec/aiops-execd-root-child
 
 id -u aiopsd >/dev/null 2>&1 || useradd --system --home /var/lib/aiops-execd --shell /usr/sbin/nologin aiopsd
 id -u aiops-run >/dev/null 2>&1 || useradd --system --home /var/lib/aiops-run --shell /usr/sbin/nologin aiops-run

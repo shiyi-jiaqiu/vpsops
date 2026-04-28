@@ -1,11 +1,13 @@
 package execd
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 )
@@ -88,7 +90,15 @@ func LoadConfig(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	if err := json.Unmarshal(b, &cfg); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
+		return Config{}, err
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return Config{}, errors.New("config contains multiple JSON values")
+		}
 		return Config{}, err
 	}
 	if err := cfg.Validate(); err != nil {

@@ -1,9 +1,0 @@
-# Example Codex MCP config snippet.
-# Add this to your local Codex config, adjusting the repository path if needed.
-#
-# This starts a local stdio MCP server. It does not expose a remote MCP port and
-# it reads the existing .env through the aiops CLI.
-
-[mcp_servers.vpsops]
-command = "/path/to/vpsops/bin/vpsops-mcp"
-args = []
