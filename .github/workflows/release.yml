@@ -32,6 +32,9 @@ jobs:
       - name: Python syntax check
         run: python3 -m py_compile bin/aiops
 
+      - name: Python CLI tests
+        run: python3 scripts/test-aiops-cli.py
+
       - name: Package linux release assets
         run: VERSION="${GITHUB_REF_NAME}" ./scripts/package-release.sh
 

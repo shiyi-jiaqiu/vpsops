@@ -6,7 +6,7 @@ privileged code easy to audit.
 ## Top-level directories
 
 - `.github/workflows/`: CI and release automation. This layer builds and publishes release assets; it does not hold live VPS credentials.
-- `bin/`: local operator CLI entrypoints. `bin/vpsops` is the human-facing wrapper around `bin/aiops`.
+- `bin/`: local operator CLI entrypoints. `bin/vpsops` is the AI/operator wrapper around `bin/aiops`; default command output is agent JSON and scripts use `--raw` when they parse remote stdout.
 - `cmd/aiops-execd/`: Go `main` package for the remote exec daemon.
 - `internal/execd/`: daemon implementation. This is private Go code and should not be imported by external modules.
 - `deploy/`: target-host templates for config, systemd, Caddy, and sudoers.
@@ -18,7 +18,7 @@ privileged code easy to audit.
 Current package boundary:
 
 - `cmd/aiops-execd`: process startup, flags, signal handling.
-- `internal/execd`: config, auth, HTTP handlers, job store, child execution, doctor checks, and validation.
+- `internal/execd`: config, auth, HTTP handlers, job lifecycle, job store, helper execution protocol, event/audit logging, doctor checks, and validation.
 
 The single `internal/execd` package is acceptable while the daemon remains small. Split it only when there is a clear dependency boundary, for example:
 

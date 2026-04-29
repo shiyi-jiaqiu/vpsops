@@ -11,8 +11,8 @@ This avoids storing root-capable VPS operation tokens in GitHub secrets. If a fu
 Create and push an explicit tag:
 
 ```bash
-git tag v0.1.3
-git push origin main v0.1.3
+git tag v0.1.5
+git push origin main v0.1.5
 ```
 
 The `test-and-release` workflow publishes:
@@ -28,13 +28,13 @@ checksums.txt
 Deploy a published release from the local control machine:
 
 ```bash
-./scripts/deploy-release.sh --version v0.1.3 --hosts jp,la,sg,gcp
+./scripts/deploy-release.sh --version v0.1.5 --hosts jp,la,sg,gcp
 ```
 
 Verify live hosts without changing binaries:
 
 ```bash
-./scripts/deploy-release.sh --version v0.1.3 --verify-only
+./scripts/deploy-release.sh --version v0.1.5 --verify-only
 ```
 
 The deploy script performs a serial rollout:
@@ -63,14 +63,16 @@ It then validates sudoers and restarts `aiops-execd`.
 
 ## Bootstrap
 
-Use `scripts/bootstrap-release-host.sh` only for initial host setup or rebuilds. It requires an explicit tag and downloads verified release assets directly; it does not pipe mutable remote scripts into `sudo bash`.
+Use `scripts/bootstrap-release-host.sh` only for initial host setup or rebuilds. It requires an explicit tag, validates the proxy patch inputs, and downloads verified release assets directly; it does not pipe mutable remote scripts into `sudo bash`.
 
 ## Manual Install
 
 For a single host where `vpsops` is not yet available, install a tagged release from a checked-out tag:
 
 ```bash
-git clone --branch v0.1.3 --depth 1 https://github.com/shiyi-jiaqiu/vpsops.git
+git clone --branch v0.1.5 --depth 1 https://github.com/shiyi-jiaqiu/vpsops.git
 cd vpsops
-sudo VERSION=v0.1.3 ./scripts/install-release.sh
+sudo VERSION=v0.1.5 ./scripts/install-release.sh
 ```
+
+`VERSION=latest` is rejected by all install/bootstrap/deploy entrypoints.

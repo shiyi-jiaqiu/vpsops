@@ -39,7 +39,7 @@ func TestPrepareJobLockKeyConflict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	j, reused, err := s.prepareJob(req, hashBytes(body), AuthInfo{TokenID: "ai-run"}, "127.0.0.1")
+	j, reused, err := s.lifecycle.prepareJob(req, hashBytes(body), AuthInfo{TokenID: "ai-run"}, "127.0.0.1")
 	if err != nil {
 		t.Fatalf("prepare first job: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestPrepareJobLockKeyConflict(t *testing.T) {
 		t.Fatalf("expected lock key %q, got %q", req.LockKey, j.lockKey)
 	}
 
-	_, _, err = s.prepareJob(req, hashBytes(append(body, 'x')), AuthInfo{TokenID: "ai-run"}, "127.0.0.1")
+	_, _, err = s.lifecycle.prepareJob(req, hashBytes(append(body, 'x')), AuthInfo{TokenID: "ai-run"}, "127.0.0.1")
 	if !errors.Is(err, errLockBusy) {
 		t.Fatalf("expected lock busy, got %v", err)
 	}
@@ -69,7 +69,7 @@ func TestReleaseJobClearsLockKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	j, _, err := s.prepareJob(req, hashBytes(body), AuthInfo{TokenID: "ai-run"}, "127.0.0.1")
+	j, _, err := s.lifecycle.prepareJob(req, hashBytes(body), AuthInfo{TokenID: "ai-run"}, "127.0.0.1")
 	if err != nil {
 		t.Fatalf("prepare first job: %v", err)
 	}
@@ -80,13 +80,15 @@ func TestReleaseJobClearsLockKey(t *testing.T) {
 		StartedAt:  time.Now().UTC(),
 		FinishedAt: time.Now().UTC(),
 	})
-	s.releaseJob(j)
+	if err := s.lifecycle.releaseJob(j); err != nil {
+		t.Fatal(err)
+	}
 
 	nextBody, err := json.Marshal(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.prepareJob(req, hashBytes(nextBody), AuthInfo{TokenID: "ai-run"}, "127.0.0.1"); err != nil {
+	if _, _, err := s.lifecycle.prepareJob(req, hashBytes(nextBody), AuthInfo{TokenID: "ai-run"}, "127.0.0.1"); err != nil {
 		t.Fatalf("expected lock to be released: %v", err)
 	}
 }
@@ -119,6 +121,38 @@ func TestParseTailBytes(t *testing.T) {
 	r = httptest.NewRequest("GET", "/v1/jobs/job/stdout?tail_bytes=101", nil)
 	if _, err := parseTailBytes(r, 100); err == nil {
 		t.Fatal("expected oversized tail_bytes to fail")
+	}
+}
+
+func TestHealthIncludesExecutorCapacity(t *testing.T) {
+	s := newTestServer(t, 2)
+	req := RunRequest{Mode: "shell", Cmd: "sleep 10", Privilege: PrivilegeUser, Cwd: "/tmp", TimeoutSec: 10}
+	if err := normalizeRequest(&req, s.cfg); err != nil {
+		t.Fatal(err)
+	}
+	j, _, err := s.lifecycle.prepareJob(req, requestHash(req), AuthInfo{TokenID: "ai-run"}, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		j.setResult(RunResult{JobID: j.id, State: StateSucceeded, ExitCode: 0, FinishedAt: time.Now().UTC()})
+		_ = s.lifecycle.releaseJob(j)
+	}()
+
+	httpReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	s.handleHealth(w, httpReq)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	concurrency, concurrencyOK := payload["concurrency"].(float64)
+	runningJobs, runningOK := payload["running_jobs"].(float64)
+	if payload["status"] != "ok" || !concurrencyOK || !runningOK || concurrency != 2 || runningJobs != 1 {
+		t.Fatalf("unexpected health payload: %#v", payload)
 	}
 }
 
@@ -171,6 +205,7 @@ func TestHandleRunReturns500ForPrepareJobInternalError(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.store = &JobStore{dir: filepath.Join(base, "missing-parent", "jobs")}
+	s.lifecycle.store = s.store
 
 	body := strings.NewReader(`{"mode":"shell","cmd":"echo ok","privilege":"user","cwd":"/tmp","timeout_sec":1}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/run", body)
@@ -184,6 +219,74 @@ func TestHandleRunReturns500ForPrepareJobInternalError(t *testing.T) {
 	}
 	if strings.Contains(w.Body.String(), "missing-parent") {
 		t.Fatalf("internal path leaked in response: %s", w.Body.String())
+	}
+}
+
+func TestHandleRunRejectsUnknownRequestFields(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Tokens = []TokenConfig{{ID: "ai-run", SHA256: SHA256Hex("good-token")}}
+	base := t.TempDir()
+	cfg.Storage.JobDir = filepath.Join(base, "jobs")
+	cfg.Storage.LogDir = filepath.Join(base, "logs")
+	s, err := NewServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := strings.NewReader(`{"mode":"shell","cmd":"echo ok","privilege":"user","cwd":"/tmp","timeout_sec":1,"timeoutt_sec":99}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/run", body)
+	req.Header.Set("Authorization", "Bearer good-token")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	s.handleRun(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown request field, got %d body=%s", w.Code, w.Body.String())
+	}
+	var errResp ErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatal(err)
+	}
+	if errResp.Code != "invalid_request" || !strings.Contains(errResp.Error, "unknown field") {
+		t.Fatalf("unexpected error response: %+v", errResp)
+	}
+}
+
+func TestHandleRunHonorsExplicitWaitZero(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Tokens = []TokenConfig{{ID: "ai-run", SHA256: SHA256Hex("good-token")}}
+	cfg.Limits.DefaultWaitSec = 25
+	base := t.TempDir()
+	cfg.Storage.JobDir = filepath.Join(base, "jobs")
+	cfg.Storage.LogDir = filepath.Join(base, "logs")
+	s, err := NewServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := strings.NewReader(`{"mode":"shell","cmd":"sleep 5","privilege":"user","cwd":"/tmp","timeout_sec":5,"wait_sec":0}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/run", body)
+	req.Header.Set("Authorization", "Bearer good-token")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	s.handleRun(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 for explicit wait_sec=0, got %d body=%s", w.Code, w.Body.String())
+	}
+	var summary JobSummary
+	if err := json.Unmarshal(w.Body.Bytes(), &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary.JobID == "" || summary.Result != nil {
+		t.Fatalf("expected async job summary without result, got %+v", summary)
+	}
+	if j := s.lifecycle.getJob(summary.JobID); j != nil {
+		select {
+		case <-j.done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("async job did not finish during test cleanup")
+		}
 	}
 }
 
@@ -209,7 +312,7 @@ func TestHandleRunReturns409ForIdempotencyConflict(t *testing.T) {
 	if err := normalizeRequest(&existingReq, cfg); err != nil {
 		t.Fatal(err)
 	}
-	s.idempotency["ai-run:same"] = &job{
+	s.lifecycle.idempotency["ai-run:same"] = &job{
 		id:   "20260426T000000-existing",
 		hash: requestHash(existingReq),
 		done: make(chan struct{}),
@@ -223,6 +326,56 @@ func TestHandleRunReturns409ForIdempotencyConflict(t *testing.T) {
 	s.handleRun(w, req)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 for idempotency conflict, got %d body=%s", w.Code, w.Body.String())
+	}
+	var errResp ErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatal(err)
+	}
+	if errResp.Code != "idempotency_conflict" || errResp.Error == "" {
+		t.Fatalf("unexpected error response: %+v", errResp)
+	}
+}
+
+func TestHandleRunReturnsStableBusyErrorCode(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Tokens = []TokenConfig{{ID: "ai-run", SHA256: SHA256Hex("good-token")}}
+	cfg.Limits.Concurrency = 1
+	base := t.TempDir()
+	cfg.Storage.JobDir = filepath.Join(base, "jobs")
+	cfg.Storage.LogDir = filepath.Join(base, "logs")
+	s, err := NewServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	holdingReq := RunRequest{Mode: "shell", Cmd: "sleep 1", Privilege: PrivilegeUser, Cwd: "/tmp", TimeoutSec: 5}
+	if err := normalizeRequest(&holdingReq, cfg); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = s.lifecycle.prepareJob(holdingReq, requestHash(holdingReq), AuthInfo{TokenID: "ai-run"}, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := strings.NewReader(`{"mode":"shell","cmd":"echo busy","privilege":"user","cwd":"/tmp","timeout_sec":5}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/run", body)
+	req.Header.Set("Authorization", "Bearer good-token")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleRun(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for busy executor, got %d body=%s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("expected retry-after 1, got %q", got)
+	}
+	var errResp ErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatal(err)
+	}
+	if errResp.Code != "executor_busy" || errResp.RetryAfterSec != 1 {
+		t.Fatalf("unexpected busy error response: %+v", errResp)
 	}
 }
 
@@ -238,7 +391,7 @@ func TestAuthorizeJobAccessUsesMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	j, _, err := s.prepareJob(req, hashBytes(body), AuthInfo{TokenID: "ai-root", AllowRoot: true}, "203.0.113.10")
+	j, _, err := s.lifecycle.prepareJob(req, hashBytes(body), AuthInfo{TokenID: "ai-root", AllowRoot: true}, "203.0.113.10")
 	if err != nil {
 		t.Fatalf("prepare job: %v", err)
 	}
@@ -252,9 +405,9 @@ func TestAuthorizeJobAccessUsesMetadata(t *testing.T) {
 		t.Fatalf("expected other run token denied, allowed=%v err=%v", allowed, err)
 	}
 
-	s.mu.Lock()
-	delete(s.jobs, j.id)
-	s.mu.Unlock()
+	s.lifecycle.mu.Lock()
+	delete(s.lifecycle.jobs, j.id)
+	s.lifecycle.mu.Unlock()
 	allowed, err = s.authorizeJobAccess(AuthInfo{TokenID: "ai-root", AllowRoot: true}, j.id)
 	if err != nil || !allowed {
 		t.Fatalf("expected stored metadata root access, allowed=%v err=%v", allowed, err)

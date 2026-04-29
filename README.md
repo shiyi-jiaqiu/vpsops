@@ -13,7 +13,8 @@ This is not a sandbox. It is a controlled management channel for trusted AI tool
 - Root-mode commands require a root-capable token and run through `sudo -n -C 4 /usr/local/libexec/aiops-execd-root-child`.
 - The service listens on `127.0.0.1:7843` by default. Put Caddy, Tailscale, Cloudflare Access, or an SSH tunnel in front of it.
 - Every command gets a `job_id` and writes `input.json`, `metadata.json`, `result.json`, `stdout.log`, and `stderr.log` under `/var/lib/aiops-execd/jobs`.
-- Completed commands append an audit JSON line to `/var/log/aiops-execd/audit.log`. This is local troubleshooting evidence, not tamper-proof audit, because root commands can modify local files.
+- Completed commands append an audit JSON line to `/var/log/aiops-execd/audit.log`. The command preview is best-effort redacted and the full command is represented by `cmd_hash`. This is local troubleshooting evidence, not tamper-proof audit, because root commands can modify local files.
+- Daemon operational events are emitted as JSON lines on stderr without command text.
 - Job directories are cleaned according to `retention_days`, `max_jobs_retained`, and `max_total_job_bytes`.
 - Failed authentication attempts are throttled per TCP peer by the `security.auth_failure_*` settings.
 
@@ -48,8 +49,8 @@ Do not commit built Linux binaries to git. Tag releases are built by GitHub Acti
 Create a release:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.5
+git push origin v0.1.5
 ```
 
 The workflow uploads:
@@ -63,12 +64,12 @@ checksums.txt
 Install a tagged release binary on a VPS from a checked-out tag:
 
 ```bash
-git clone --branch v0.1.0 --depth 1 https://github.com/shiyi-jiaqiu/vpsops.git
+git clone --branch v0.1.5 --depth 1 https://github.com/shiyi-jiaqiu/vpsops.git
 cd vpsops
-sudo VERSION=v0.1.0 ./scripts/install-release.sh
+sudo VERSION=v0.1.5 ./scripts/install-release.sh
 ```
 
-Do not pipe a mutable remote installer directly into `sudo bash`. For full host bootstrap, pass an explicit release tag:
+`install-release.sh` requires an explicit `VERSION` tag; `latest` is intentionally rejected. Do not pipe a mutable remote installer directly into `sudo bash`. For full host bootstrap, pass an explicit release tag:
 
 ```bash
 sudo ./scripts/bootstrap-release-host.sh \
@@ -79,7 +80,7 @@ sudo ./scripts/bootstrap-release-host.sh \
   --proxy caddy \
   --config-path /etc/caddy/Caddyfile \
   --marker '# aiops-execd marker' \
-  --version v0.1.0
+  --version v0.1.5
 ```
 
 The install script only installs the binary under `/usr/local/bin/aiops-execd` and the two helper copies under `/usr/local/libexec/`. You still need to create users, config, sudoers, and the systemd unit.
@@ -87,8 +88,8 @@ The install script only installs the binary under `/usr/local/bin/aiops-execd` a
 For existing configured hosts, use the local rollout script:
 
 ```bash
-./scripts/deploy-release.sh --version v0.1.0 --hosts jp,la,sg,gcp
-./scripts/deploy-release.sh --version v0.1.0 --verify-only
+./scripts/deploy-release.sh --version v0.1.5 --hosts jp,la,sg,gcp
+./scripts/deploy-release.sh --version v0.1.5 --verify-only
 ```
 
 ## API
@@ -111,6 +112,12 @@ curl -sS http://127.0.0.1:7843/v1/run \
 
 Responses use HTTP status for API-level success and `exit_code` for command-level success. A command that exits `7` still returns HTTP `200` if it executed normally.
 
+Error responses include a stable machine-readable `code` while preserving the human-readable `error` field:
+
+```json
+{"error":"executor is busy","code":"executor_busy","retry_after_sec":1}
+```
+
 Job lookup endpoints also require `Authorization`. A normal token can read only jobs it created; a root-capable token can read all jobs:
 
 ```bash
@@ -130,13 +137,14 @@ curl -sS 'http://127.0.0.1:7843/v1/jobs/JOB_ID/stdout?tail_bytes=65536' \
 
 ## Local CLI
 
-Use `vpsops` as the human-facing CLI. It reads `.env` from this repo root, hides the HTTPS/token details, and calls the existing `/v1/run` API.
+Use `vpsops` as the AI/operator CLI. It reads `.env` from this repo root, hides the HTTPS/token details, and calls the existing `/v1/run` API. The default command output is stable agent JSON; use `--raw` when a script or human workflow needs the remote stdout/stderr bytes directly.
 
 ```bash
 cp .env.example .env
 vpsops hosts
 vpsops jp health
 vpsops jp -- hostname
+vpsops jp --raw -- hostname
 vpsops jp --user -- id -un
 vpsops jp batch --cmd 'hostname' --cmd 'uptime' --cmd 'df -h /'
 vpsops la docker ps
@@ -167,9 +175,9 @@ vpsops <host> batch \
   --cmd 'df -h /'
 ```
 
-`batch` runs commands sequentially inside one remote job. By default it continues after failed steps so diagnostics are not lost, but the final exit code is non-zero if any step failed. Use `--stop-on-error` for deployment/update sequences where later steps must not run after a failure.
+`batch` runs commands sequentially inside one remote job. By default it continues after failed steps so diagnostics are not lost, but the final exit code is non-zero if any step failed. Use `--stop-on-error` for deployment/update sequences where later steps must not run after a failure. In default agent JSON mode, `batch` includes per-step status in `steps`.
 
-By default the local CLI uses `AIOPS_DEFAULT_PRIVILEGE` from `.env`; this workspace currently uses root to match the VPS admin workflow. Add `--user` for the unprivileged execution path. The CLI follows async jobs, prints stdout/stderr directly, returns the remote `exit_code`, and retries short `executor is busy` responses because each small VPS is intentionally single-concurrency.
+By default the local CLI uses `AIOPS_DEFAULT_PRIVILEGE` from `.env`; this workspace currently uses root to match the VPS admin workflow. Add `--user` for the unprivileged execution path. The CLI follows async jobs, emits stable agent JSON, returns the remote `exit_code`, and retries short `executor_busy` responses. New installs default to `limits.concurrency=2`; use `--lock-key` for mutable operations that must not overlap and `--idempotency-key` for retry-safe requests.
 
 Host configuration supports both the original single-host variables and future host-scoped variables:
 
@@ -178,6 +186,7 @@ AIOPS_DEFAULT_HOST=example
 AIOPS_HOSTS=example
 AIOPS_HOST_EXAMPLE_ALIASES=ex
 AIOPS_DEFAULT_PRIVILEGE=root
+AIOPS_OUTPUT=agent-json
 
 AIOPS_HOST_EXAMPLE_BASE=https://example.com/hidden-aiops-path
 AIOPS_HOST_EXAMPLE_RUN_TOKEN=...

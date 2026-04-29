@@ -32,6 +32,7 @@ type RunRequest struct {
 	MaxStderrLogBytes int64             `json:"max_stderr_log_bytes"`
 	IdempotencyKey    string            `json:"idempotency_key"`
 	LockKey           string            `json:"lock_key"`
+	waitSecSet        bool
 }
 
 type RunResult struct {
@@ -60,13 +61,21 @@ type JobSummary struct {
 	Result     *RunResult `json:"result,omitempty"`
 }
 
+type ErrorResponse struct {
+	Error         string `json:"error"`
+	Code          string `json:"code"`
+	RetryAfterSec int    `json:"retry_after_sec,omitempty"`
+}
+
 type JobMetadata struct {
-	JobID      string    `json:"job_id"`
-	TokenID    string    `json:"token_id"`
-	Privilege  string    `json:"privilege"`
-	RemoteAddr string    `json:"remote_addr"`
-	LockKey    string    `json:"lock_key,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
+	JobID          string    `json:"job_id"`
+	TokenID        string    `json:"token_id"`
+	Privilege      string    `json:"privilege"`
+	RemoteAddr     string    `json:"remote_addr"`
+	LockKey        string    `json:"lock_key,omitempty"`
+	IdempotencyKey string    `json:"idempotency_key,omitempty"`
+	RequestHash    string    `json:"request_hash,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 type childSpec struct {

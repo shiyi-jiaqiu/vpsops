@@ -114,6 +114,14 @@ func (s *JobStore) ReadResult(jobID string) (RunResult, error) {
 	return res, nil
 }
 
+func (s *JobStore) Remove(jobID string) error {
+	dir, err := s.jobDir(jobID)
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(dir)
+}
+
 func (s *JobStore) ReadOutput(jobID, name string) ([]byte, error) {
 	dir, err := s.jobDir(jobID)
 	if err != nil {

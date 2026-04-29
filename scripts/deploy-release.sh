@@ -12,7 +12,7 @@ vpsops CLI. GitHub Actions builds the release assets; this script performs the
 trusted local rollout and verification using the operator's local .env tokens.
 
 Options:
-  --version VERSION      Required explicit release tag, for example v0.1.3.
+  --version VERSION      Required explicit release tag, for example v0.1.5.
   --hosts LIST          Comma-separated host aliases. Default: jp,la,sg,gcp.
   --repo OWNER/REPO     GitHub repo. Default: shiyi-jiaqiu/vpsops.
   --verify-only         Do not deploy; only verify current live state.
@@ -66,7 +66,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$VERSION" ]] || die "--version is required"
-[[ "$VERSION" =~ ^v[0-9A-Za-z._-]+$ ]] || die "--version must look like v0.1.3"
+[[ "$VERSION" =~ ^v[0-9A-Za-z._-]+$ ]] || die "--version must look like v0.1.5"
 [[ "$VERSION" != "latest" ]] || die "latest is not allowed; use an explicit tag"
 [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "--repo must look like owner/repo"
 [[ "$POLL_TIMEOUT" =~ ^[0-9]+$ ]] || die "--poll-timeout must be an integer"
@@ -215,7 +215,7 @@ start_deploy() {
   remote_cmd="install -d -o root -g root -m 0700 ${REMOTE_DIR} && printf %s ${encoded} | base64 -d >${remote_script} && chmod 700 ${remote_script} && systemd-run --unit=${unit} --collect /bin/bash ${remote_script}"
 
   echo "==> ${host}: start deploy ${VERSION}"
-  vpsops "$host" --timeout 20 --wait 10 -- "$remote_cmd"
+  vpsops "$host" --raw --timeout 20 --wait 10 -- "$remote_cmd"
 }
 
 verify_host() {
@@ -225,7 +225,7 @@ verify_host() {
   local log_path="${REMOTE_DIR}/aiops-execd-upgrade-${VERSION}.log"
 
   echo "==> ${host}: verify"
-  output="$(vpsops "$host" batch --stop-on-error \
+  output="$(vpsops "$host" batch --raw --stop-on-error \
     --cmd "systemctl is-active aiops-execd" \
     --cmd "tail -n 80 ${log_path} 2>/dev/null || true" \
     --cmd "sha256sum /usr/local/bin/aiops-execd /usr/local/libexec/aiops-execd-run-child /usr/local/libexec/aiops-execd-root-child" \

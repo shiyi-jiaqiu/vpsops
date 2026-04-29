@@ -10,8 +10,10 @@ import (
 )
 
 var (
-	envKeyRe = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
-	jobIDRe  = regexp.MustCompile(`^[A-Za-z0-9._-]{8,80}$`)
+	envKeyRe     = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
+	jobIDRe      = regexp.MustCompile(`^[A-Za-z0-9._-]{8,80}$`)
+	tokenIDRe    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$`)
+	controlKeyRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.@:/-]{0,200}$`)
 )
 
 func normalizeRequest(req *RunRequest, cfg Config) error {
@@ -70,7 +72,7 @@ func normalizeRequest(req *RunRequest, cfg Config) error {
 	if req.TimeoutSec < 1 || req.TimeoutSec > cfg.Limits.MaxTimeoutSec {
 		return fmt.Errorf("timeout_sec must be 1..%d", cfg.Limits.MaxTimeoutSec)
 	}
-	if req.WaitSec == 0 {
+	if req.WaitSec == 0 && !req.waitSecSet {
 		req.WaitSec = cfg.Limits.DefaultWaitSec
 	}
 	if req.WaitSec < 0 || req.WaitSec > cfg.Limits.MaxWaitSec {
@@ -112,6 +114,12 @@ func normalizeRequest(req *RunRequest, cfg Config) error {
 	}
 	req.Cwd = cwd
 	if err := validateEnv(req.Env, cfg.Env); err != nil {
+		return err
+	}
+	if err := validateControlKey("lock_key", req.LockKey); err != nil {
+		return err
+	}
+	if err := validateControlKey("idempotency_key", req.IdempotencyKey); err != nil {
 		return err
 	}
 	return nil
@@ -172,6 +180,16 @@ func validateEnv(env map[string]string, cfg EnvConfig) error {
 		if len(v) > 4096 {
 			return fmt.Errorf("env value %q is too large", k)
 		}
+	}
+	return nil
+}
+
+func validateControlKey(name, value string) error {
+	if value == "" {
+		return nil
+	}
+	if !controlKeyRe.MatchString(value) {
+		return fmt.Errorf("%s is invalid", name)
 	}
 	return nil
 }

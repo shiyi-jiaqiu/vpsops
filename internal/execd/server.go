@@ -1,17 +1,15 @@
 package execd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
 	"path"
-	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,12 +20,8 @@ type Server struct {
 	cfg         Config
 	store       *JobStore
 	http        *http.Server
-	sem         chan struct{}
-	mu          sync.Mutex
+	lifecycle   *jobLifecycle
 	auditMu     sync.Mutex
-	jobs        map[string]*job
-	idempotency map[string]*job
-	locks       map[string]*job
 	authLimiter *authFailureLimiter
 }
 
@@ -40,17 +34,18 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	if report, err := store.Cleanup(cfg.Storage, cfg.Limits, nil); err != nil {
-		log.Printf("initial job cleanup: %v", err)
+		logEvent("job_cleanup_failed", map[string]any{"phase": "initial", "error": err.Error()})
 	} else if len(report.DeletedIDs) > 0 {
-		log.Printf("initial job cleanup deleted=%d bytes=%d", len(report.DeletedIDs), report.DeletedBytes)
+		logEvent("job_cleanup_completed", map[string]any{
+			"phase":         "initial",
+			"deleted_jobs":  len(report.DeletedIDs),
+			"deleted_bytes": report.DeletedBytes,
+		})
 	}
 	s := &Server{
 		cfg:         cfg,
 		store:       store,
-		sem:         make(chan struct{}, cfg.Limits.Concurrency),
-		jobs:        map[string]*job{},
-		idempotency: map[string]*job{},
-		locks:       map[string]*job{},
+		lifecycle:   newJobLifecycle(store, cfg.Storage, cfg.Limits),
 		authLimiter: newAuthFailureLimiter(cfg.Security),
 	}
 	mux := http.NewServeMux()
@@ -80,7 +75,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	running := s.lifecycle.runningCount()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":          "ok",
+		"concurrency":     s.cfg.Limits.Concurrency,
+		"running_jobs":    running,
+		"available_slots": max(0, s.cfg.Limits.Concurrency-running),
+	})
 }
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
@@ -90,44 +91,58 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := readLimitedBody(w, r, s.cfg.Limits.MaxRequestBytes)
 	if err != nil {
-		writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		writeError(w, http.StatusRequestEntityTooLarge, "request_body_too_large", "request body too large")
 		return
 	}
-	var req RunRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+	req, err := decodeRunRequest(body)
+	if err != nil {
+		if requestDecodeErrorCode(err) == "invalid_json" {
+			writeError(w, http.StatusBadRequest, "invalid_json", "invalid json")
+		} else {
+			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		}
 		return
 	}
 	if err := normalizeRequest(&req, s.cfg); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	if req.Privilege == PrivilegeRoot && !auth.AllowRoot {
-		writeError(w, http.StatusForbidden, "root privilege requires root-capable token")
+		writeError(w, http.StatusForbidden, "forbidden_root", "root privilege requires root-capable token")
 		return
 	}
 
 	reqHash := requestHash(req)
-	j, reused, err := s.prepareJob(req, reqHash, auth, clientAddress(r))
+	j, reused, err := s.lifecycle.prepareJob(req, reqHash, auth, clientAddress(r))
 	if err != nil {
 		if errors.Is(err, errBusy) {
-			writeError(w, http.StatusConflict, "executor is busy")
+			logEvent("run_rejected", runRejectFields(auth, r, "executor_busy"))
+			writeErrorRetry(w, http.StatusConflict, "executor_busy", "executor is busy", 1)
 			return
 		}
 		if errors.Is(err, errLockBusy) {
-			writeError(w, http.StatusConflict, "lock_key is busy")
+			fields := runRejectFields(auth, r, "lock_busy")
+			fields["lock_key"] = req.LockKey
+			logEvent("run_rejected", fields)
+			writeError(w, http.StatusConflict, "lock_busy", "lock_key is busy")
 			return
 		}
 		if errors.Is(err, errIdempotencyConflict) {
-			writeError(w, http.StatusConflict, "idempotency key reused with different request")
+			fields := runRejectFields(auth, r, "idempotency_conflict")
+			fields["idempotency_key"] = req.IdempotencyKey
+			logEvent("run_rejected", fields)
+			writeError(w, http.StatusConflict, "idempotency_conflict", "idempotency key reused with different request")
 			return
 		}
-		log.Printf("prepare job: %v", err)
-		writeError(w, http.StatusInternalServerError, "prepare job failed")
+		logEvent("run_rejected", runRejectFields(auth, r, "prepare_failed", "error", err.Error()))
+		writeError(w, http.StatusInternalServerError, "prepare_failed", "prepare job failed")
 		return
 	}
 	if !reused {
+		logEvent("job_queued", jobEventFields(j, req))
 		go s.runJob(j, req)
+	} else {
+		logEvent("job_reused", jobEventFields(j, req))
 	}
 
 	select {
@@ -138,98 +153,31 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-var errBusy = errors.New("busy")
-var errLockBusy = errors.New("lock busy")
-var errIdempotencyConflict = errors.New("idempotency key reused with different request")
-
-func (s *Server) prepareJob(req RunRequest, reqHash string, auth AuthInfo, remote string) (*job, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if req.IdempotencyKey != "" {
-		key := auth.TokenID + ":" + req.IdempotencyKey
-		if existing := s.idempotency[key]; existing != nil {
-			if existing.hash != reqHash {
-				return nil, false, errIdempotencyConflict
-			}
-			return existing, true, nil
-		}
-	}
-	if req.LockKey != "" {
-		if existing := s.locks[req.LockKey]; existing != nil {
-			if !jobDone(existing) {
-				return nil, false, errLockBusy
-			}
-			delete(s.locks, req.LockKey)
-		}
-	}
-	select {
-	case s.sem <- struct{}{}:
-	default:
-		return nil, false, errBusy
-	}
-	jobID := newJobID()
-	j := &job{
-		id:      jobID,
-		state:   StateQueued,
-		done:    make(chan struct{}),
-		started: time.Now().UTC(),
-		hash:    reqHash,
-		tokenID: auth.TokenID,
-		remote:  remote,
-		lockKey: req.LockKey,
-	}
-	if err := s.store.Create(jobID, req); err != nil {
-		<-s.sem
-		return nil, false, err
-	}
-	if err := s.store.SaveMetadata(JobMetadata{
-		JobID:      jobID,
-		TokenID:    auth.TokenID,
-		Privilege:  req.Privilege,
-		RemoteAddr: remote,
-		LockKey:    req.LockKey,
-		CreatedAt:  j.started,
-	}); err != nil {
-		<-s.sem
-		return nil, false, err
-	}
-	s.jobs[jobID] = j
-	if req.LockKey != "" {
-		s.locks[req.LockKey] = j
-	}
-	if req.IdempotencyKey != "" {
-		s.idempotency[auth.TokenID+":"+req.IdempotencyKey] = j
-	}
-	return j, false, nil
-}
-
 func (s *Server) runJob(j *job, req RunRequest) {
 	defer func() {
-		s.releaseJob(j)
+		if err := s.lifecycle.releaseJob(j); err != nil {
+			logEvent("job_release_failed", map[string]any{"job_id": j.id, "error": err.Error()})
+		}
 		s.cleanupJobs()
 	}()
-	j.mu.Lock()
-	j.state = StateRunning
-	j.mu.Unlock()
+	s.lifecycle.markRunning(j)
+	logEvent("job_started", jobEventFields(j, req))
 	ctx, cancel := helperContext(req)
 	defer cancel()
 	res := runViaChild(ctx, s.cfg, s.store, j.id, req)
 	if err := s.store.SaveResult(res); err != nil {
-		log.Printf("save result job=%s: %v", j.id, err)
+		logEvent("job_result_save_failed", map[string]any{"job_id": j.id, "error": err.Error()})
 	}
 	if err := s.writeAudit(j, req, res); err != nil {
-		log.Printf("write audit job=%s: %v", j.id, err)
+		logEvent("audit_write_failed", map[string]any{"job_id": j.id, "error": err.Error()})
 	}
 	j.setResult(res)
-}
-
-func (s *Server) releaseJob(j *job) {
-	s.mu.Lock()
-	if j.lockKey != "" && s.locks[j.lockKey] == j {
-		delete(s.locks, j.lockKey)
-	}
-	s.mu.Unlock()
-	<-s.sem
+	fields := jobEventFields(j, req)
+	fields["state"] = res.State
+	fields["exit_code"] = res.ExitCode
+	fields["timed_out"] = res.TimedOut
+	fields["duration_ms"] = res.DurationMS
+	logEvent("job_finished", fields)
 }
 
 func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
@@ -239,28 +187,26 @@ func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
 	}
 	jobID := r.PathValue("job_id")
 	if !jobIDRe.MatchString(jobID) {
-		writeError(w, http.StatusBadRequest, "invalid job_id")
+		writeError(w, http.StatusBadRequest, "invalid_job_id", "invalid job_id")
 		return
 	}
 	allowed, err := s.authorizeJobAccess(auth, jobID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "job not found")
+		writeError(w, http.StatusNotFound, "job_not_found", "job not found")
 		return
 	}
 	if !allowed {
-		writeError(w, http.StatusForbidden, "forbidden")
+		writeError(w, http.StatusForbidden, "forbidden", "forbidden")
 		return
 	}
-	s.mu.Lock()
-	j := s.jobs[jobID]
-	s.mu.Unlock()
+	j := s.lifecycle.getJob(jobID)
 	if j != nil {
 		writeJSON(w, http.StatusOK, j.summary())
 		return
 	}
 	res, err := s.store.ReadResult(jobID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "job not found")
+		writeError(w, http.StatusNotFound, "job_not_found", "job not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, JobSummary{JobID: jobID, State: res.State, StartedAt: res.StartedAt, FinishedAt: &res.FinishedAt, Result: &res})
@@ -274,26 +220,26 @@ func (s *Server) handleOutput(name string) http.HandlerFunc {
 		}
 		jobID := r.PathValue("job_id")
 		if !jobIDRe.MatchString(jobID) {
-			writeError(w, http.StatusBadRequest, "invalid job_id")
+			writeError(w, http.StatusBadRequest, "invalid_job_id", "invalid job_id")
 			return
 		}
 		allowed, err := s.authorizeJobAccess(auth, jobID)
 		if err != nil {
-			writeError(w, http.StatusNotFound, "job not found")
+			writeError(w, http.StatusNotFound, "job_not_found", "job not found")
 			return
 		}
 		if !allowed {
-			writeError(w, http.StatusForbidden, "forbidden")
+			writeError(w, http.StatusForbidden, "forbidden", "forbidden")
 			return
 		}
 		tailBytes, err := parseTailBytes(r, max(s.cfg.Limits.MaxStdoutLogBytes, s.cfg.Limits.MaxStderrLogBytes))
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			writeError(w, http.StatusBadRequest, "invalid_tail_bytes", err.Error())
 			return
 		}
 		b, err := s.store.ReadOutputTail(jobID, path.Clean(name), tailBytes)
 		if err != nil {
-			writeError(w, http.StatusNotFound, "output not found")
+			writeError(w, http.StatusNotFound, "output_not_found", "output not found")
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -304,13 +250,24 @@ func (s *Server) handleOutput(name string) http.HandlerFunc {
 
 func (s *Server) authenticateRequest(w http.ResponseWriter, r *http.Request) (AuthInfo, bool) {
 	peer := peerAddress(r)
+	remote := clientAddress(r)
 	auth, err := authenticate(r, s.cfg)
 	if err != nil {
 		if s.authLimiter != nil && s.authLimiter.recordFailureAndExceeded(peer) {
-			writeError(w, http.StatusTooManyRequests, "too many authentication failures")
+			logEvent("auth_rejected", map[string]any{
+				"reason":      "rate_limited",
+				"peer_addr":   peer,
+				"remote_addr": remote,
+			})
+			writeError(w, http.StatusTooManyRequests, "auth_rate_limited", "too many authentication failures")
 			return AuthInfo{}, false
 		}
-		writeError(w, http.StatusUnauthorized, "unauthorized")
+		logEvent("auth_rejected", map[string]any{
+			"reason":      "unauthorized",
+			"peer_addr":   peer,
+			"remote_addr": remote,
+		})
+		writeError(w, http.StatusUnauthorized, "unauthorized", "unauthorized")
 		return AuthInfo{}, false
 	}
 	if s.authLimiter != nil {
@@ -320,20 +277,7 @@ func (s *Server) authenticateRequest(w http.ResponseWriter, r *http.Request) (Au
 }
 
 func (s *Server) authorizeJobAccess(auth AuthInfo, jobID string) (bool, error) {
-	if auth.AllowRoot {
-		return true, nil
-	}
-	s.mu.Lock()
-	j := s.jobs[jobID]
-	s.mu.Unlock()
-	if j != nil {
-		return j.tokenID == auth.TokenID, nil
-	}
-	meta, err := s.store.ReadMetadata(jobID)
-	if err != nil {
-		return false, err
-	}
-	return meta.TokenID == auth.TokenID, nil
+	return s.lifecycle.authorizeJobAccess(auth, jobID)
 }
 
 func parseTailBytes(r *http.Request, maxTailBytes int64) (int64, error) {
@@ -357,14 +301,50 @@ func readLimitedBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byt
 	return io.ReadAll(r.Body)
 }
 
+func decodeRunRequest(body []byte) (RunRequest, error) {
+	var req RunRequest
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		return RunRequest{}, err
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return RunRequest{}, errors.New("request contains multiple JSON values")
+		}
+		return RunRequest{}, err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return RunRequest{}, err
+	}
+	_, req.waitSecSet = raw["wait_sec"]
+	return req, nil
+}
+
+func requestDecodeErrorCode(err error) string {
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "invalid_json"
+	}
+	return "invalid_request"
+}
+
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func writeError(w http.ResponseWriter, code int, message string) {
-	writeJSON(w, code, map[string]string{"error": message})
+func writeError(w http.ResponseWriter, status int, code, message string) {
+	writeErrorRetry(w, status, code, message, 0)
+}
+
+func writeErrorRetry(w http.ResponseWriter, status int, code, message string, retryAfterSec int) {
+	if retryAfterSec > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSec))
+	}
+	writeJSON(w, status, ErrorResponse{Error: message, Code: code, RetryAfterSec: retryAfterSec})
 }
 
 func requestHash(req RunRequest) string {
@@ -375,15 +355,6 @@ func requestHash(req RunRequest) string {
 		return hashBytes([]byte(canonical.Cmd))
 	}
 	return hashBytes(b)
-}
-
-func jobDone(j *job) bool {
-	select {
-	case <-j.done:
-		return true
-	default:
-		return false
-	}
 }
 
 func clientAddress(r *http.Request) string {
@@ -416,114 +387,22 @@ func isLoopbackAddress(host string) bool {
 }
 
 func (s *Server) writeAudit(j *job, req RunRequest, res RunResult) error {
-	entry := map[string]any{
-		"ts":          time.Now().UTC(),
-		"job_id":      j.id,
-		"remote_addr": j.remote,
-		"token_id":    j.tokenID,
-		"privilege":   req.Privilege,
-		"cwd":         req.Cwd,
-		"cmd_hash":    hashBytes([]byte(auditCommand(req))),
-		"cmd_preview": auditPreview(req),
-		"state":       res.State,
-		"exit_code":   res.ExitCode,
-		"timed_out":   res.TimedOut,
-		"duration_ms": res.DurationMS,
-	}
-
 	s.auditMu.Lock()
 	defer s.auditMu.Unlock()
-	f, err := os.OpenFile(filepath.Join(s.cfg.Storage.LogDir, "audit.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return json.NewEncoder(f).Encode(entry)
+	return writeAuditEntry(s.cfg.Storage.LogDir, newAuditEntry(time.Now().UTC(), j, req, res))
 }
 
 func (s *Server) cleanupJobs() {
-	protected := map[string]bool{}
-	s.mu.Lock()
-	for id, j := range s.jobs {
-		if !jobDone(j) {
-			protected[id] = true
-		}
-	}
-	s.mu.Unlock()
-
-	report, err := s.store.Cleanup(s.cfg.Storage, s.cfg.Limits, protected)
+	report, err := s.lifecycle.cleanupJobs()
 	if err != nil {
-		log.Printf("job cleanup: %v", err)
+		logEvent("job_cleanup_failed", map[string]any{"phase": "runtime", "error": err.Error()})
 		return
 	}
 	if len(report.DeletedIDs) > 0 {
-		log.Printf("job cleanup deleted=%d bytes=%d", len(report.DeletedIDs), report.DeletedBytes)
-	}
-	s.pruneMemory(report.DeletedIDs)
-}
-
-func (s *Server) pruneMemory(deletedIDs []string) {
-	deleteIDs := map[string]bool{}
-	for _, id := range deletedIDs {
-		deleteIDs[id] = true
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var doneJobs []*job
-	for _, j := range s.jobs {
-		if jobDone(j) {
-			doneJobs = append(doneJobs, j)
-		}
-	}
-	if s.cfg.Storage.RetentionDays > 0 {
-		cutoff := time.Now().Add(-time.Duration(s.cfg.Storage.RetentionDays) * 24 * time.Hour)
-		for _, j := range doneJobs {
-			if j.started.Before(cutoff) {
-				deleteIDs[j.id] = true
-			}
-		}
-	}
-	if s.cfg.Limits.MaxJobsRetained > 0 {
-		sort.Slice(doneJobs, func(i, k int) bool {
-			return doneJobs[i].started.After(doneJobs[k].started)
+		logEvent("job_cleanup_completed", map[string]any{
+			"phase":         "runtime",
+			"deleted_jobs":  len(report.DeletedIDs),
+			"deleted_bytes": report.DeletedBytes,
 		})
-		for idx, j := range doneJobs {
-			if idx >= s.cfg.Limits.MaxJobsRetained {
-				deleteIDs[j.id] = true
-			}
-		}
 	}
-	if len(deleteIDs) == 0 {
-		return
-	}
-	for id := range deleteIDs {
-		delete(s.jobs, id)
-	}
-	for key, j := range s.idempotency {
-		if deleteIDs[j.id] {
-			delete(s.idempotency, key)
-		}
-	}
-}
-
-func auditCommand(req RunRequest) string {
-	if req.Mode == "argv" {
-		if b, err := json.Marshal(req.Argv); err == nil {
-			return string(b)
-		}
-		return strings.Join(req.Argv, "\x00")
-	}
-	return req.Cmd
-}
-
-func auditPreview(req RunRequest) string {
-	const maxPreview = 200
-	preview := auditCommand(req)
-	preview = strings.ReplaceAll(preview, "\n", `\n`)
-	preview = strings.ReplaceAll(preview, "\r", `\r`)
-	if len(preview) <= maxPreview {
-		return preview
-	}
-	return preview[:maxPreview] + "..."
 }

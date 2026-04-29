@@ -8,6 +8,7 @@ Run this before pushing:
 go test ./...
 go vet ./...
 python3 -m py_compile bin/aiops
+python3 scripts/test-aiops-cli.py
 bash -n scripts/*.sh bin/vpsops
 ./scripts/smoke-local.sh
 ```
@@ -17,6 +18,7 @@ bash -n scripts/*.sh bin/vpsops
 - `go test ./...`: unit and package-level behavior, including auth, validation, job store, child execution, doctor checks, and HTTP handler edge cases.
 - `go vet ./...`: common Go correctness checks.
 - `python3 -m py_compile bin/aiops`: local CLI syntax check.
+- `python3 scripts/test-aiops-cli.py`: local CLI behavior checks for host config, default agent JSON output, raw overrides, batch step reporting, control keys, and retry handling.
 - `bash -n scripts/*.sh bin/vpsops`: shell syntax check for operator scripts and wrappers.
 - `scripts/smoke-local.sh`: end-to-end local daemon test using a temporary server and fake sudo shim.
 
@@ -37,6 +39,7 @@ Tag pushes run GitHub Actions:
 go test ./...
 ./scripts/smoke-local.sh
 python3 -m py_compile bin/aiops
+python3 scripts/test-aiops-cli.py
 ./scripts/package-release.sh
 ```
 

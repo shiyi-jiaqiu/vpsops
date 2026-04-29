@@ -29,7 +29,7 @@
     "default_stderr_log_bytes": 1048576,
     "max_stdout_log_bytes": 16777216,
     "max_stderr_log_bytes": 16777216,
-    "concurrency": 1,
+    "concurrency": 2,
     "max_jobs_retained": 1000
   },
   "security": {

@@ -7,52 +7,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"io"
 	"os"
 	"os/exec"
-	"sync"
 	"syscall"
 	"time"
 )
-
-type job struct {
-	id      string
-	state   string
-	result  *RunResult
-	done    chan struct{}
-	started time.Time
-	hash    string
-	tokenID string
-	remote  string
-	lockKey string
-	mu      sync.Mutex
-}
-
-func (j *job) setResult(res RunResult) {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	j.result = &res
-	j.state = res.State
-	close(j.done)
-}
-
-func (j *job) summary() JobSummary {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	var finished *time.Time
-	if j.result != nil {
-		t := j.result.FinishedAt
-		finished = &t
-	}
-	return JobSummary{
-		JobID:      j.id,
-		State:      j.state,
-		StartedAt:  j.started,
-		FinishedAt: finished,
-		Result:     j.result,
-	}
-}
 
 func newJobID() string {
 	now := time.Now().UTC().Format("20060102T150405")
@@ -81,31 +41,13 @@ func runViaChild(ctx context.Context, cfg Config, store *JobStore, jobID string,
 	}
 	defer stderrFile.Close()
 
-	spec := childSpec{
-		Mode:              req.Mode,
-		Cmd:               req.Cmd,
-		Argv:              req.Argv,
-		Privilege:         req.Privilege,
-		Cwd:               req.Cwd,
-		Env:               cleanEnv(req.Env, req.Privilege, cfg),
-		Stdin:             req.Stdin,
-		TimeoutSec:        req.TimeoutSec,
-		KillGraceSec:      req.KillGraceSec,
-		MaxStdoutLogBytes: req.MaxStdoutLogBytes,
-		MaxStderrLogBytes: req.MaxStderrLogBytes,
-		Execution:         cfg.Execution,
-	}
+	spec := childSpecFromRequest(req, cfg)
 	specBytes, err := json.Marshal(spec)
 	if err != nil {
 		return internalFailure(jobID, started, err)
 	}
 
-	var cmd *exec.Cmd
-	if req.Privilege == PrivilegeRoot {
-		cmd = exec.CommandContext(ctx, cfg.Helpers.SudoPath, "-n", "-C", "4", cfg.Helpers.RootChildPath)
-	} else {
-		cmd = exec.CommandContext(ctx, cfg.Helpers.SudoPath, "-n", "-C", "4", "-u", cfg.Execution.RunUser, cfg.Helpers.RunChildPath)
-	}
+	cmd := exec.CommandContext(ctx, cfg.Helpers.SudoPath, sudoHelperArgs(cfg, req.Privilege)...)
 	cmd.Stdin = bytes.NewReader(specBytes)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = durationSeconds(req.KillGraceSec + 2)
@@ -154,18 +96,11 @@ func runViaChild(ctx context.Context, cfg Config, store *JobStore, jobID string,
 	<-copyDone
 	<-copyDone
 
-	var child childResult
 	resultBytes, readErr := io.ReadAll(io.LimitReader(resultR, 64<<10))
-	if readErr == nil && len(bytes.TrimSpace(resultBytes)) > 0 {
-		readErr = json.Unmarshal(resultBytes, &child)
+	if readErr != nil {
+		return internalFailure(jobID, started, readErr)
 	}
-	if readErr != nil || child.State == "" {
-		child.State = StateFailed
-		child.ExitCode, child.Signal = exitStatus(waitErr)
-		if waitErr != nil {
-			child.Error = waitErr.Error()
-		}
-	}
+	child := decodeChildResult(resultBytes, waitErr)
 	finished := time.Now().UTC()
 	res := RunResult{
 		JobID:              jobID,
@@ -187,6 +122,61 @@ func runViaChild(ctx context.Context, cfg Config, store *JobStore, jobID string,
 	return res
 }
 
+func childSpecFromRequest(req RunRequest, cfg Config) childSpec {
+	return childSpec{
+		Mode:              req.Mode,
+		Cmd:               req.Cmd,
+		Argv:              req.Argv,
+		Privilege:         req.Privilege,
+		Cwd:               req.Cwd,
+		Env:               cleanEnv(req.Env, req.Privilege, cfg),
+		Stdin:             req.Stdin,
+		TimeoutSec:        req.TimeoutSec,
+		KillGraceSec:      req.KillGraceSec,
+		MaxStdoutLogBytes: req.MaxStdoutLogBytes,
+		MaxStderrLogBytes: req.MaxStderrLogBytes,
+		Execution:         cfg.Execution,
+	}
+}
+
+func sudoHelperArgs(cfg Config, privilege string) []string {
+	args := []string{"-n", "-C", "4"}
+	if privilege == PrivilegeRoot {
+		return append(args, cfg.Helpers.RootChildPath)
+	}
+	return append(args, "-u", cfg.Execution.RunUser, cfg.Helpers.RunChildPath)
+}
+
+func decodeChildResult(resultBytes []byte, waitErr error) childResult {
+	trimmed := bytes.TrimSpace(resultBytes)
+	if len(trimmed) > 0 {
+		var child childResult
+		if err := json.Unmarshal(trimmed, &child); err == nil && child.State != "" {
+			return child
+		} else if err != nil {
+			exitCode, signal := protocolFailureExit(waitErr)
+			return childResult{State: StateFailed, ExitCode: exitCode, Signal: signal, Error: "invalid child result: " + err.Error()}
+		}
+		exitCode, signal := protocolFailureExit(waitErr)
+		return childResult{State: StateFailed, ExitCode: exitCode, Signal: signal, Error: "invalid child result: missing state"}
+	}
+
+	exitCode, signal := protocolFailureExit(waitErr)
+	errText := "missing child result"
+	if waitErr != nil {
+		errText += ": " + waitErr.Error()
+	}
+	return childResult{State: StateFailed, ExitCode: exitCode, Signal: signal, Error: errText}
+}
+
+func protocolFailureExit(waitErr error) (int, *string) {
+	exitCode, signal := exitStatus(waitErr)
+	if waitErr == nil && exitCode == 0 {
+		exitCode = -1
+	}
+	return exitCode, signal
+}
+
 func internalFailure(jobID string, started time.Time, err error) RunResult {
 	return RunResult{
 		JobID:      jobID,
@@ -204,8 +194,4 @@ func helperContext(req RunRequest) (context.Context, context.CancelFunc) {
 		extra = 30
 	}
 	return context.WithTimeout(context.Background(), time.Duration(extra)*time.Second)
-}
-
-func isContextErr(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }

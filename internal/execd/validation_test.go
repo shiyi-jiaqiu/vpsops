@@ -101,6 +101,35 @@ func TestNormalizeRequestRejectsRootFalsePrivilegeRoot(t *testing.T) {
 	}
 }
 
+func TestNormalizeRequestRejectsUnsafeControlKeys(t *testing.T) {
+	cfg := DefaultConfig()
+	req := RunRequest{
+		Mode:           "shell",
+		Cmd:            "echo ok",
+		Privilege:      PrivilegeUser,
+		Cwd:            "/tmp",
+		TimeoutSec:     1,
+		LockKey:        "apt global",
+		IdempotencyKey: "retry-1",
+	}
+	if err := normalizeRequest(&req, cfg); err == nil || !strings.Contains(err.Error(), "lock_key") {
+		t.Fatalf("expected unsafe lock_key to fail, got %v", err)
+	}
+
+	req.LockKey = "apt:global"
+	req.IdempotencyKey = "retry 1"
+	if err := normalizeRequest(&req, cfg); err == nil || !strings.Contains(err.Error(), "idempotency_key") {
+		t.Fatalf("expected unsafe idempotency_key to fail, got %v", err)
+	}
+}
+
+func TestDefaultConfigUsesConservativeParallelism(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.Limits.Concurrency != 2 {
+		t.Fatalf("expected default concurrency 2, got %d", cfg.Limits.Concurrency)
+	}
+}
+
 func TestLoadConfigRejectsUnknownFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	content := `{
@@ -125,5 +154,16 @@ func TestLoadConfigRejectsMultipleJSONValues(t *testing.T) {
 	}
 	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "multiple JSON values") {
 		t.Fatalf("expected multiple JSON values error, got %v", err)
+	}
+}
+
+func TestLoadConfigRejectsUnsafeTokenID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	content := `{"tokens":[{"id":"bad token","sha256":"` + strings.Repeat("a", 64) + `"}]}`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "token id") {
+		t.Fatalf("expected token id validation error, got %v", err)
 	}
 }

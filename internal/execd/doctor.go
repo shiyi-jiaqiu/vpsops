@@ -200,15 +200,9 @@ func probeChildViaSudo(name string, cfg Config, privilege string) doctorCheck {
 		return doctorCheck{Status: doctorFail, Name: name, Detail: err.Error()}
 	}
 
-	args := []string{"-n", "-C", "4"}
-	if privilege == PrivilegeUser {
-		args = append(args, "-u", cfg.Execution.RunUser, cfg.Helpers.RunChildPath)
-	} else {
-		args = append(args, cfg.Helpers.RootChildPath)
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, cfg.Helpers.SudoPath, args...)
+	cmd := exec.CommandContext(ctx, cfg.Helpers.SudoPath, sudoHelperArgs(cfg, privilege)...)
 	cmd.Stdin = bytes.NewReader(specBytes)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

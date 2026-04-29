@@ -52,13 +52,29 @@ for required in domain path_prefix run_token root_token proxy_kind config_path m
   fi
 done
 if [[ -z "${version}" || "${version}" == "latest" ]]; then
-  echo "--version must be an explicit release tag such as v0.1.0" >&2
+  echo "--version must be an explicit release tag such as v0.1.5" >&2
   usage >&2
   exit 2
 fi
 if [[ "${version}" != v* ]]; then
-  echo "--version must look like a release tag, for example v0.1.0" >&2
+  echo "--version must look like a release tag, for example v0.1.5" >&2
   usage >&2
+  exit 2
+fi
+if [[ ! "${repo}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+  echo "REPO must look like owner/repo" >&2
+  exit 2
+fi
+if [[ ! "${domain}" =~ ^[A-Za-z0-9.-]+$ ]]; then
+  echo "--domain contains unsupported characters" >&2
+  exit 2
+fi
+if [[ ! "${path_prefix}" =~ ^/[A-Za-z0-9._~/-]+$ || "${path_prefix}" == "/" || "${path_prefix}" == */ ]]; then
+  echo "--path must be an absolute hidden path without a trailing slash" >&2
+  exit 2
+fi
+if [[ ! -f "${config_path}" ]]; then
+  echo "--config-path does not exist or is not a regular file: ${config_path}" >&2
   exit 2
 fi
 
@@ -136,7 +152,7 @@ cat >/etc/aiops-execd/config.json <<EOF
     "default_stderr_log_bytes": 1048576,
     "max_stdout_log_bytes": 16777216,
     "max_stderr_log_bytes": 16777216,
-    "concurrency": 1,
+    "concurrency": 2,
     "max_jobs_retained": 1000
   },
   "security": {
@@ -240,7 +256,7 @@ else:
 text = "".join(lines)
 path.write_text(text)
 PY
-    caddy validate --config /etc/caddy/Caddyfile >/dev/null
+    caddy validate --config "${config_path}" >/dev/null
     systemctl reload caddy
     ;;
   nginx)

@@ -2,9 +2,18 @@
 set -euo pipefail
 
 REPO="${REPO:-shiyi-jiaqiu/vpsops}"
-VERSION="${VERSION:-latest}"
+VERSION="${VERSION:-}"
 PREFIX="${PREFIX:-/usr/local}"
 LIBEXEC_DIR="${LIBEXEC_DIR:-/usr/local/libexec}"
+
+if [[ -z "${VERSION}" || "${VERSION}" == "latest" ]]; then
+  echo "VERSION must be an explicit release tag such as v0.1.5" >&2
+  exit 2
+fi
+if [[ "${VERSION}" != v* ]]; then
+  echo "VERSION must look like a release tag, for example v0.1.5" >&2
+  exit 2
+fi
 
 case "$(uname -m)" in
   x86_64|amd64) arch="amd64" ;;
@@ -13,11 +22,7 @@ case "$(uname -m)" in
 esac
 
 asset="vpsops-execd_linux_${arch}.tar.gz"
-if [[ "${VERSION}" == "latest" ]]; then
-  base="https://github.com/${REPO}/releases/latest/download"
-else
-  base="https://github.com/${REPO}/releases/download/${VERSION}"
-fi
+base="https://github.com/${REPO}/releases/download/${VERSION}"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "${tmp}"' EXIT

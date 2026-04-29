@@ -127,7 +127,7 @@ func DefaultConfig() Config {
 			DefaultStderrLogBytes: 1 << 20,
 			MaxStdoutLogBytes:     16 << 20,
 			MaxStderrLogBytes:     16 << 20,
-			Concurrency:           1,
+			Concurrency:           2,
 			MaxJobsRetained:       1000,
 		},
 		Security: SecurityConfig{
@@ -173,6 +173,9 @@ func (c Config) Validate() error {
 	for _, t := range c.Tokens {
 		if t.ID == "" {
 			return errors.New("token id is required")
+		}
+		if !tokenIDRe.MatchString(t.ID) {
+			return fmt.Errorf("token id %q is invalid", t.ID)
 		}
 		if seen[t.ID] {
 			return fmt.Errorf("duplicate token id %q", t.ID)
