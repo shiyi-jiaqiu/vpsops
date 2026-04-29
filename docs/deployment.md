@@ -43,6 +43,8 @@ The deploy script performs a serial rollout:
 - Starts one host update at a time through `vpsops`.
 - Downloads the matching release asset on the target host.
 - Verifies the release checksum before extraction.
+- Keeps daemon state and log directories owned by `aiopsd`.
+- Stores transient upgrade scripts, logs, and backups in a root-owned work directory.
 - Backs up current daemon/helper/sudoers files.
 - Installs the daemon and both helper paths.
 - Rewrites sudoers with current helper SHA256 digests.

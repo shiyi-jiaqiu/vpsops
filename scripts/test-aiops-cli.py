@@ -443,6 +443,74 @@ OUT
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         self.assertIn("all hosts verified", proc.stdout)
 
+    def test_deploy_start_keeps_service_state_owned_by_aiopsd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fakebin = Path(tmp) / "bin"
+            fakebin.mkdir()
+            fake_vpsops = fakebin / "vpsops"
+            fake_vpsops.write_text(
+                """#!/usr/bin/env python3
+import base64
+import re
+import sys
+
+remote_cmd = sys.argv[-1]
+if "systemd-run" in remote_cmd:
+    if "install -d -o root -g root -m 0700 /var/lib/aiops-execd" in remote_cmd:
+        print("state dir is root-only in launcher", file=sys.stderr)
+        sys.exit(42)
+    if "install -d -o root -g root -m 0700 /root/aiops-execd-upgrades" not in remote_cmd:
+        print("missing root-owned upgrade work dir", file=sys.stderr)
+        sys.exit(43)
+    match = re.search(r"printf %s ([A-Za-z0-9+/=]+) \\| base64 -d", remote_cmd)
+    if not match:
+        print("missing encoded remote script", file=sys.stderr)
+        sys.exit(44)
+    script = base64.b64decode(match.group(1)).decode("utf-8")
+    if "install -d -o aiopsd -g aiopsd -m 0700 \\"$state_dir\\" \\"$state_dir/jobs\\" \\"$log_dir\\"" not in script:
+        print("remote script does not restore aiopsd state ownership", file=sys.stderr)
+        sys.exit(45)
+    if 'work_dir="/root/aiops-execd-upgrades"' not in script:
+        print("remote script does not use isolated root work dir", file=sys.stderr)
+        sys.exit(46)
+    print("Running as unit: aiops-execd-upgrade-v9-9-9-test.service")
+else:
+    print("active")
+    print("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  /usr/local/bin/aiops-execd")
+    print("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  /usr/local/libexec/aiops-execd-run-child")
+    print("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  /usr/local/libexec/aiops-execd-root-child")
+    print("vpsops-ok")
+""",
+                encoding="utf-8",
+            )
+            fake_vpsops.chmod(0o755)
+            fake_sleep = fakebin / "sleep"
+            fake_sleep.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            fake_sleep.chmod(0o755)
+            env = dict(os.environ)
+            env["PATH"] = str(fakebin) + os.pathsep + env["PATH"]
+            env["AIOPS_OUTPUT"] = "agent-json"
+
+            proc = subprocess.run(
+                [
+                    "bash",
+                    str(ROOT / "scripts" / "deploy-release.sh"),
+                    "--version",
+                    "v9.9.9-test",
+                    "--no-wait-release",
+                    "--hosts",
+                    "jp",
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("all hosts verified", proc.stdout)
+
     def test_builtin_commands_support_raw_output_override(self) -> None:
         host = aiops.HostConfig(
             name="jp",

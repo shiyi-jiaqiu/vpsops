@@ -50,7 +50,9 @@ VERIFY_ONLY=0
 WAIT_RELEASE=1
 POLL_TIMEOUT=180
 POLL_INTERVAL=5
-REMOTE_DIR="/var/lib/aiops-execd"
+REMOTE_STATE_DIR="/var/lib/aiops-execd"
+REMOTE_LOG_DIR="/var/log/aiops-execd"
+REMOTE_WORK_DIR="/root/aiops-execd-upgrades"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -111,9 +113,12 @@ set -euo pipefail
 
 version="$VERSION"
 repo="$REPO"
-remote_dir="$REMOTE_DIR"
-log="\${remote_dir}/aiops-execd-upgrade-\${version}.log"
-install -d -o root -g root -m 0700 "\$remote_dir"
+state_dir="$REMOTE_STATE_DIR"
+log_dir="$REMOTE_LOG_DIR"
+work_dir="$REMOTE_WORK_DIR"
+log="\${work_dir}/aiops-execd-upgrade-\${version}.log"
+install -d -o root -g root -m 0700 "\$work_dir"
+install -d -o aiopsd -g aiopsd -m 0700 "\$state_dir" "\$state_dir/jobs" "\$log_dir"
 exec > >(tee -a "\$log") 2>&1
 
 rollback_needed=0
@@ -147,7 +152,7 @@ esac
 
 asset="vpsops-execd_linux_\${arch}.tar.gz"
 base="https://github.com/\${repo}/releases/download/\${version}"
-tmp="\$(mktemp -d "\${remote_dir}/upgrade.XXXXXX")"
+tmp="\$(mktemp -d "\${work_dir}/upgrade.XXXXXX")"
 cleanup() { rm -rf "\$tmp"; }
 trap 'rc=\$?; cleanup; if (( rc != 0 )); then rollback "\$rc"; fi' EXIT
 
@@ -161,7 +166,7 @@ curl -fsSL --retry 3 --connect-timeout 10 -o "\$tmp/checksums.txt" "\$base/check
   tar -xzf "\$asset"
 )
 
-backup_dir="\${remote_dir}/backup-\${version}-\$(date +%Y%m%d%H%M%S)"
+backup_dir="\${work_dir}/backup-\${version}-\$(date +%Y%m%d%H%M%S)"
 install -d -o root -g root -m 0700 "\$backup_dir"
 cp -a /usr/local/bin/aiops-execd "\$backup_dir/aiops-execd"
 cp -a /usr/local/libexec/aiops-execd-run-child "\$backup_dir/aiops-execd-run-child"
@@ -204,7 +209,7 @@ unit_suffix() {
 
 start_deploy() {
   local host="$1"
-  local remote_script="${REMOTE_DIR}/upgrade-${VERSION}.sh"
+  local remote_script="${REMOTE_WORK_DIR}/upgrade-${VERSION}.sh"
   local unit="aiops-execd-upgrade-$(unit_suffix)"
   local script="$TMP_DIR/remote-upgrade-${host}.sh"
   local encoded
@@ -212,7 +217,7 @@ start_deploy() {
 
   write_remote_script "$script"
   encoded="$(base64 -w0 "$script")"
-  remote_cmd="install -d -o root -g root -m 0700 ${REMOTE_DIR} && printf %s ${encoded} | base64 -d >${remote_script} && chmod 700 ${remote_script} && systemd-run --unit=${unit} --collect /bin/bash ${remote_script}"
+  remote_cmd="install -d -o root -g root -m 0700 ${REMOTE_WORK_DIR} && printf %s ${encoded} | base64 -d >${remote_script} && chmod 700 ${remote_script} && systemd-run --unit=${unit} --collect /bin/bash ${remote_script}"
 
   echo "==> ${host}: start deploy ${VERSION}"
   vpsops "$host" --raw --timeout 20 --wait 10 -- "$remote_cmd"
@@ -222,7 +227,7 @@ verify_host() {
   local host="$1"
   local output
   local hash
-  local log_path="${REMOTE_DIR}/aiops-execd-upgrade-${VERSION}.log"
+  local log_path="${REMOTE_WORK_DIR}/aiops-execd-upgrade-${VERSION}.log"
 
   echo "==> ${host}: verify"
   output="$(vpsops "$host" batch --raw --stop-on-error \
