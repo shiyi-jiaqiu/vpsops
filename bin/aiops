@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -29,6 +30,7 @@ STEP_EVENT_PREFIX = "__AIOPS_STEP_JSON__" + secrets.token_hex(8) + "__"
 OUTPUT_RAW = "raw"
 OUTPUT_JSON = "json"
 OUTPUT_AGENT_JSON = "agent-json"
+OUTPUT_AGENT_FULL = "agent-full"
 
 
 @dataclass
@@ -185,11 +187,13 @@ def default_output_mode(env: dict[str, str]) -> str:
         return OUTPUT_AGENT_JSON
     if raw in {"raw", "human"}:
         return OUTPUT_RAW
-    if raw in {"agent", "agent-json"}:
+    if raw in {"agent", "agent-json", "agent-compact"}:
         return OUTPUT_AGENT_JSON
+    if raw in {"agent-full", "agent-json-full", "full-agent-json"}:
+        return OUTPUT_AGENT_FULL
     if raw == "json":
         return OUTPUT_JSON
-    raise AiopsError("AIOPS_OUTPUT must be raw, json, or agent-json")
+    raise AiopsError("AIOPS_OUTPUT must be raw, json, agent-json, or agent-full")
 
 
 def http_json(method: str, url: str, token: str | None = None, body: Any | None = None, timeout: int = 30) -> tuple[int, Any]:
@@ -225,50 +229,99 @@ def print_json_object(payload: dict[str, Any]) -> None:
 
 
 def extract_agent_step_events(stdout: str) -> tuple[str, list[dict[str, int]]]:
-    clean_lines: list[str] = []
+    clean_parts: list[str] = []
     steps: list[dict[str, int]] = []
-    for line in stdout.splitlines(keepends=True):
-        raw = line.rstrip("\r\n")
-        if raw.startswith(STEP_EVENT_PREFIX):
-            try:
-                event = json.loads(raw[len(STEP_EVENT_PREFIX) :])
-            except json.JSONDecodeError:
-                clean_lines.append(line)
-                continue
-            if event.get("event") == "end":
-                steps.append(
-                    {
-                        "index": int(event.get("index", 0)),
-                        "exit_code": int(event.get("exit_code", 1)),
-                        "duration_sec": int(event.get("duration_sec", 0)),
-                    }
-                )
+    pos = 0
+    while True:
+        marker_at = stdout.find(STEP_EVENT_PREFIX, pos)
+        if marker_at < 0:
+            clean_parts.append(stdout[pos:])
+            break
+        clean_parts.append(stdout[pos:marker_at])
+        event_start = marker_at + len(STEP_EVENT_PREFIX)
+        event_end = stdout.find("\n", event_start)
+        if event_end < 0:
+            event_text = stdout[event_start:]
+            next_pos = len(stdout)
+        else:
+            event_text = stdout[event_start:event_end].rstrip("\r")
+            next_pos = event_end + 1
+        try:
+            event = json.loads(event_text)
+        except json.JSONDecodeError:
+            clean_parts.append(stdout[marker_at:next_pos])
+            pos = next_pos
             continue
-        clean_lines.append(line)
-    return "".join(clean_lines), steps
+        if event.get("event") == "end":
+            steps.append(
+                {
+                    "index": int(event.get("index", 0)),
+                    "exit_code": int(event.get("exit_code", 1)),
+                    "duration_sec": int(event.get("duration_sec", 0)),
+                }
+            )
+        pos = next_pos
+    return "".join(clean_parts), steps
 
 
-def agent_result_payload(host: HostConfig, payload: dict[str, Any]) -> dict[str, Any]:
+def is_agent_output_mode(mode: str) -> bool:
+    return mode in {OUTPUT_AGENT_JSON, OUTPUT_AGENT_FULL}
+
+
+def agent_result_payload(host: HostConfig, payload: dict[str, Any], *, compact: bool = True) -> dict[str, Any]:
     exit_code = int(payload.get("exit_code", 1))
     state = payload.get("state", "failed")
     stdout, steps = extract_agent_step_events(payload.get("stdout") or "")
+    ok = state == "succeeded" and exit_code == 0
     result = {
         "schema": "aiops.cli.result.v1",
-        "ok": state == "succeeded" and exit_code == 0,
+        "ok": ok,
         "host": host.name,
         "job_id": payload.get("job_id"),
-        "state": state,
-        "exit_code": exit_code,
-        "timed_out": bool(payload.get("timed_out", False)),
         "duration_ms": payload.get("duration_ms", 0),
         "stdout": stdout,
-        "stderr": payload.get("stderr") or "",
+    }
+    stderr = payload.get("stderr") or ""
+    error = payload.get("error") or ""
+    flags = {
+        "timed_out": bool(payload.get("timed_out", False)),
         "stdout_truncated": bool(payload.get("stdout_truncated", False)),
         "stderr_truncated": bool(payload.get("stderr_truncated", False)),
         "stdout_log_truncated": bool(payload.get("stdout_log_truncated", False)),
         "stderr_log_truncated": bool(payload.get("stderr_log_truncated", False)),
-        "error": payload.get("error") or "",
     }
+    if not compact:
+        result.update(
+            {
+                "state": state,
+                "exit_code": exit_code,
+                "timed_out": flags["timed_out"],
+                "stderr": stderr,
+                "stdout_truncated": flags["stdout_truncated"],
+                "stderr_truncated": flags["stderr_truncated"],
+                "stdout_log_truncated": flags["stdout_log_truncated"],
+                "stderr_log_truncated": flags["stderr_log_truncated"],
+                "error": error,
+            }
+        )
+    elif not ok:
+        result.update(
+            {
+                "state": state,
+                "exit_code": exit_code,
+                "stderr": stderr,
+                "error": error,
+            }
+        )
+        result.update(flags)
+    else:
+        if stderr:
+            result["stderr"] = stderr
+        if error:
+            result["error"] = error
+        for key, value in flags.items():
+            if value:
+                result[key] = value
     if steps:
         result["steps"] = steps
     return result
@@ -278,6 +331,16 @@ def error_output_mode(argv: list[str], env: dict[str, str] | None = None) -> str
     flags = cli_tokens_before_command(argv)
     if "--raw" in flags:
         return OUTPUT_RAW
+    if "--output" in flags:
+        idx = flags.index("--output")
+        if idx + 1 < len(flags):
+            value = flags[idx + 1].strip().lower()
+            if value in {"raw", "human"}:
+                return OUTPUT_RAW
+            if value in {"agent", "agent-json", "agent-compact"}:
+                return OUTPUT_AGENT_JSON
+            if value in {"agent-full", "agent-json-full", "full-agent-json"}:
+                return OUTPUT_AGENT_FULL
     if "--agent-json" in flags or os.environ.get("AIOPS_AGENT_JSON") == "1":
         return OUTPUT_AGENT_JSON
     if env is not None:
@@ -326,6 +389,42 @@ def run_remote(
     busy_retries: int = 6,
 ) -> int:
     mode = output_mode or (OUTPUT_AGENT_JSON if agent_json else OUTPUT_JSON if json_output else host.output_mode)
+    payload = execute_remote(host, req, follow=follow, busy_retries=busy_retries)
+    if not follow and isinstance(payload, dict) and payload.get("state") in {"queued", "running"} and "exit_code" not in payload:
+        if is_agent_output_mode(mode):
+            print_json_object(agent_job_payload(host, payload))
+        elif mode == OUTPUT_JSON:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(f"job_id={payload['job_id']} state={payload['state']}")
+        return 0
+
+    if is_agent_output_mode(mode):
+        print_json_object(agent_result_payload(host, payload, compact=mode != OUTPUT_AGENT_FULL))
+    elif mode == OUTPUT_JSON:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        stdout = payload.get("stdout") or ""
+        stderr = payload.get("stderr") or ""
+        if stdout:
+            sys.stdout.write(stdout)
+            if not stdout.endswith("\n"):
+                sys.stdout.write("\n")
+        if stderr:
+            sys.stderr.write(stderr)
+            if not stderr.endswith("\n"):
+                sys.stderr.write("\n")
+
+    exit_code = int(payload.get("exit_code", 1))
+    state = payload.get("state", "failed")
+    if not is_agent_output_mode(mode) and (state != "succeeded" or exit_code != 0):
+        print(f"[aiops] host={host.name} job={payload.get('job_id')} state={state} exit_code={exit_code}", file=sys.stderr)
+    if exit_code == 0 and state == "succeeded":
+        return 0
+    return exit_code if 1 <= exit_code <= 125 else 1
+
+
+def execute_remote(host: HostConfig, req: dict[str, Any], *, follow: bool = True, busy_retries: int = 6) -> dict[str, Any]:
     privilege = req.get("privilege", host.default_privilege)
     token = token_for(host, privilege)
     status = 0
@@ -354,40 +453,11 @@ def run_remote(
             time.sleep(max(1, retry_after))
     if status == 202 and follow:
         payload = poll_job(host, token, payload["job_id"], int(req["timeout_sec"]))
-    elif status == 202:
-        if mode == OUTPUT_AGENT_JSON:
-            print_json_object(agent_job_payload(host, payload))
-        elif mode == OUTPUT_JSON:
-            print(json.dumps(payload, ensure_ascii=False, indent=2))
-        else:
-            print(f"job_id={payload['job_id']} state={payload['state']}")
-        return 0
     elif isinstance(payload, dict) and payload.get("result"):
         payload = payload["result"]
-
-    if mode == OUTPUT_AGENT_JSON:
-        print_json_object(agent_result_payload(host, payload))
-    elif mode == OUTPUT_JSON:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-    else:
-        stdout = payload.get("stdout") or ""
-        stderr = payload.get("stderr") or ""
-        if stdout:
-            sys.stdout.write(stdout)
-            if not stdout.endswith("\n"):
-                sys.stdout.write("\n")
-        if stderr:
-            sys.stderr.write(stderr)
-            if not stderr.endswith("\n"):
-                sys.stderr.write("\n")
-
-    exit_code = int(payload.get("exit_code", 1))
-    state = payload.get("state", "failed")
-    if mode != OUTPUT_AGENT_JSON and (state != "succeeded" or exit_code != 0):
-        print(f"[aiops] host={host.name} job={payload.get('job_id')} state={state} exit_code={exit_code}", file=sys.stderr)
-    if exit_code == 0 and state == "succeeded":
-        return 0
-    return exit_code if 1 <= exit_code <= 125 else 1
+    if not isinstance(payload, dict):
+        raise AiopsError("remote returned a non-object response")
+    return payload
 
 
 def poll_job(host: HostConfig, token: str, job_id: str, timeout_sec: int) -> dict[str, Any]:
@@ -452,6 +522,12 @@ def add_run_options(parser: argparse.ArgumentParser) -> None:
 
 
 def add_output_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--output",
+        choices=["raw", "json", "agent", "agent-json", "agent-full"],
+        default="",
+        help="select output profile; old --raw/--json/--agent-json flags remain supported",
+    )
     parser.add_argument("--raw", action="store_true", help="print raw stdout/stderr")
     parser.add_argument("--json", action="store_true", help="print the full result JSON")
     parser.add_argument("--agent-json", action="store_true", help="print a stable one-object JSON result for agents")
@@ -476,9 +552,15 @@ def parse_run(rest: list[str], host: HostConfig) -> int:
 
 
 def selected_output_mode(args: argparse.Namespace, host: HostConfig) -> str:
-    selected = int(bool(args.raw)) + int(bool(args.json)) + int(bool(args.agent_json))
+    selected = int(bool(args.output)) + int(bool(args.raw)) + int(bool(args.json)) + int(bool(args.agent_json))
     if selected > 1:
-        raise AiopsError("--raw, --json, and --agent-json are mutually exclusive")
+        raise AiopsError("--output, --raw, --json, and --agent-json are mutually exclusive")
+    if args.output:
+        if args.output in {"agent", "agent-json"}:
+            return OUTPUT_AGENT_JSON
+        if args.output == "agent-full":
+            return OUTPUT_AGENT_FULL
+        return args.output
     if args.raw:
         return OUTPUT_RAW
     if args.json:
@@ -503,12 +585,17 @@ def batch_script(commands: list[str], stop_on_error: bool, agent_json: bool = Fa
             "__aiops_step() {",
             "  __idx=\"$1\"",
             "  __cmd=\"$2\"",
-            f"  printf '\\n{STEP_EVENT_PREFIX}{{\"index\":%s,\"event\":\"begin\"}}\\n' \"$__idx\"",
+            "  __out=$(mktemp)",
+            "  __err=$(mktemp)",
+            f"  printf '{STEP_EVENT_PREFIX}{{\"index\":%s,\"event\":\"begin\"}}\\n' \"$__idx\"",
             "  __start=$(date +%s)",
-            "  /bin/bash --noprofile --norc -o pipefail -c \"$__cmd\"",
+            "  /bin/bash --noprofile --norc -o pipefail -c \"$__cmd\" >\"$__out\" 2>\"$__err\"",
             "  __rc=$?",
             "  __end=$(date +%s)",
             f"  printf '{STEP_EVENT_PREFIX}{{\"index\":%s,\"event\":\"end\",\"exit_code\":%s,\"duration_sec\":%s}}\\n' \"$__idx\" \"$__rc\" \"$((__end-__start))\"",
+            "  cat \"$__out\"",
+            "  cat \"$__err\" >&2",
+            "  rm -f \"$__out\" \"$__err\"",
             "  if [ \"$__rc\" -ne 0 ]; then",
             "    __aiops_batch_failed=\"$__rc\"",
             "    if [ \"$__aiops_batch_stop\" = \"1\" ]; then exit \"$__rc\"; fi",
@@ -582,9 +669,98 @@ def command_batch(host: HostConfig, rest: list[str]) -> int:
     if not commands:
         raise AiopsError("batch requires --cmd, --file, positional commands, or stdin lines")
     output_mode = selected_output_mode(args, host)
-    script = batch_script(commands, args.stop_on_error, agent_json=output_mode == OUTPUT_AGENT_JSON)
+    script = batch_script(commands, args.stop_on_error, agent_json=is_agent_output_mode(output_mode))
     req = base_run_request(args, script, host)
     return run_remote(host, req, follow=not args.no_follow, output_mode=output_mode, busy_retries=args.busy_retries)
+
+
+def command_fleet(env: dict[str, str], rest: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="aiops fleet", description="Run one command across multiple configured hosts")
+    parser.add_argument("--hosts", default="", help="comma-separated host aliases; default uses AIOPS_HOSTS")
+    parser.add_argument("--parallel", type=int, default=2, help="maximum hosts to run at once")
+    add_run_options(parser)
+    parser.add_argument("cmd", nargs=argparse.REMAINDER)
+    args = parser.parse_args(rest)
+    if args.root and args.user:
+        raise AiopsError("--root and --user are mutually exclusive")
+    validate_run_options(args)
+    require_int_range("--parallel", args.parallel, min_value=1, max_value=16)
+    host_names = split_csv(args.hosts) if args.hosts else known_hosts(env)
+    if not host_names:
+        raise AiopsError("fleet requires --hosts or AIOPS_HOSTS")
+    cmd_parts = args.cmd
+    if cmd_parts and cmd_parts[0] == "--":
+        cmd_parts = cmd_parts[1:]
+    if not cmd_parts:
+        parser.error("missing command")
+    cmd = shell_command_from_parts(cmd_parts)
+    mode = selected_output_mode(args, HostConfig("", "", "", "", "root", output_mode=default_output_mode(env)))
+
+    def run_one(input_host: str) -> tuple[int, dict[str, Any]]:
+        try:
+            host = host_config(input_host, env)
+            req = base_run_request(args, cmd, host)
+            payload = execute_remote(host, req, follow=not args.no_follow, busy_retries=args.busy_retries)
+            if not args.no_follow and not ("exit_code" in payload):
+                raise AiopsError("remote job did not include a command result")
+            if args.no_follow and payload.get("state") in {"queued", "running"} and "exit_code" not in payload:
+                result = agent_job_payload(host, payload)
+                return 0, result
+            if is_agent_output_mode(mode):
+                result = agent_result_payload(host, payload, compact=mode != OUTPUT_AGENT_FULL)
+            elif mode == OUTPUT_JSON:
+                result = dict(payload)
+                result["host"] = host.name
+            else:
+                result = {
+                    "host": host.name,
+                    "state": payload.get("state", "failed"),
+                    "exit_code": int(payload.get("exit_code", 1)),
+                    "stdout": payload.get("stdout") or "",
+                    "stderr": payload.get("stderr") or "",
+                }
+            exit_code = int(payload.get("exit_code", 0))
+            state = payload.get("state", "succeeded")
+            rc = 0 if state == "succeeded" and exit_code == 0 else exit_code if 1 <= exit_code <= 125 else 1
+            return rc, result
+        except AiopsError as exc:
+            return 2, agent_error_payload(input_host, exc)
+
+    max_workers = min(args.parallel, len(host_names))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        outcomes = list(executor.map(run_one, host_names))
+
+    return_code = 0
+    results: list[dict[str, Any]] = []
+    for rc, result in outcomes:
+        if return_code == 0 and rc != 0:
+            return_code = rc if 1 <= rc <= 125 else 1
+        results.append(result)
+
+    if mode == OUTPUT_RAW:
+        for result in results:
+            host = result.get("host", "")
+            stdout = result.get("stdout") or ""
+            stderr = result.get("stderr") or ""
+            print(f"===== {host} stdout =====")
+            if stdout:
+                sys.stdout.write(stdout)
+                if not stdout.endswith("\n"):
+                    sys.stdout.write("\n")
+            if stderr:
+                print(f"===== {host} stderr =====", file=sys.stderr)
+                sys.stderr.write(stderr)
+                if not stderr.endswith("\n"):
+                    sys.stderr.write("\n")
+    else:
+        print_json_object(
+            {
+                "schema": "aiops.cli.fleet.v1",
+                "ok": return_code == 0,
+                "results": results,
+            }
+        )
+    return return_code
 
 
 def command_health(host: HostConfig) -> int:
@@ -769,6 +945,13 @@ def command_service(host: HostConfig, rest: list[str]) -> int:
         add_output_options(parser)
         args = parser.parse_args(rest[1:])
         require_safe_name("service", args.name)
+        if args.name in {"aiops-execd", "aiops-execd.service"}:
+            cmd = (
+                "systemd-run --unit=aiops-execd-self-restart-$(date +%s) "
+                "--on-active=2s --collect /bin/systemctl restart aiops-execd "
+                "&& printf 'scheduled aiops-execd restart\\n'"
+            )
+            return run_builtin(host, cmd, timeout=30, output_mode=selected_output_mode(args, host))
         return run_builtin(
             host,
             f"systemctl restart {quoted(args.name)} && systemctl is-active {quoted(args.name)}",
@@ -807,9 +990,10 @@ def command_hosts(env: dict[str, str]) -> int:
 def usage() -> str:
     return """Usage:
   aiops hosts
+  aiops fleet [--hosts jp,la] [--parallel N] [--raw|--json|--agent-json|--output PROFILE] -- <cmd>
   aiops <host> health
-  aiops <host> [--root|--user] [--cwd DIR] [--timeout SEC] [--raw|--json|--agent-json] [--lock-key KEY] [--idempotency-key KEY] -- <cmd>
-  aiops <host> batch [--raw|--json|--agent-json] --cmd <cmd> [--cmd <cmd> ...]
+  aiops <host> [--root|--user] [--cwd DIR] [--timeout SEC] [--raw|--json|--agent-json|--output PROFILE] [--lock-key KEY] [--idempotency-key KEY] -- <cmd>
+  aiops <host> batch [--raw|--json|--agent-json|--output PROFILE] --cmd <cmd> [--cmd <cmd> ...]
   aiops <host> batch -- <cmd1> <cmd2> ...
   aiops <host> docker ps [--all]
   aiops <host> docker logs <container> [--tail N]
@@ -831,6 +1015,8 @@ def main(argv: list[str]) -> int:
         err_mode = error_output_mode(argv, env)
         if argv[0] == "hosts":
             return command_hosts(env)
+        if argv[0] == "fleet":
+            return command_fleet(env, argv[1:])
         host = host_config(argv[0], env)
         host_name = host.name
         err_mode = error_output_mode(argv, env)
@@ -856,7 +1042,7 @@ def main(argv: list[str]) -> int:
             return command_output(host, rest[0], rest[1:])
         return parse_run(rest, host)
     except AiopsError as exc:
-        if err_mode == OUTPUT_AGENT_JSON:
+        if is_agent_output_mode(err_mode):
             print_json_object(agent_error_payload(host_name, exc))
         else:
             print(f"[aiops] {exc}", file=sys.stderr)

@@ -137,7 +137,14 @@ curl -sS 'http://127.0.0.1:7843/v1/jobs/JOB_ID/stdout?tail_bytes=65536' \
 
 ## Local CLI
 
-Use `vpsops` as the AI/operator CLI. It reads `.env` from this repo root, hides the HTTPS/token details, and calls the existing `/v1/run` API. The default command output is stable agent JSON; use `--raw` when a script or human workflow needs the remote stdout/stderr bytes directly.
+Use `vpsops` as the AI/operator CLI. It reads `.env` from this repo root, hides the HTTPS/token details, and calls the existing `/v1/run` API. The default command output is compact stable agent JSON; successful commands omit default-empty diagnostic fields to reduce agent tokens, while failures keep `state`, `exit_code`, `stderr`, truncation flags, and `error`.
+
+Output profiles:
+
+- Default / `--output agent`: compact `aiops.cli.result.v1` for agents.
+- `--output agent-full`: full agent envelope, including success diagnostics.
+- `--json`: raw daemon result JSON.
+- `--raw`: remote stdout/stderr bytes for scripts or direct human inspection.
 
 ```bash
 cp .env.example .env
@@ -147,8 +154,10 @@ vpsops jp -- hostname
 vpsops jp --raw -- hostname
 vpsops jp --user -- id -un
 vpsops jp batch --cmd 'hostname' --cmd 'uptime' --cmd 'df -h /'
+vpsops fleet --hosts jp,la,sg,gcp --parallel 2 -- hostname
 vpsops la docker ps
 vpsops sg service status aiops-execd
+vpsops jp service restart aiops-execd
 vpsops gcp file read /etc/hostname
 ```
 
@@ -177,6 +186,10 @@ vpsops <host> batch \
 
 `batch` runs commands sequentially inside one remote job. By default it continues after failed steps so diagnostics are not lost, but the final exit code is non-zero if any step failed. Use `--stop-on-error` for deployment/update sequences where later steps must not run after a failure. In default agent JSON mode, `batch` includes per-step status in `steps`.
 
+`fleet` runs one command across multiple configured hosts and emits one `aiops.cli.fleet.v1` object with per-host results. Use it for read-only fan-out checks; keep mutable fleet operations guarded with `--lock-key` and conservative `--parallel` values.
+
+`service restart aiops-execd` is special-cased because a direct restart kills the job currently carrying the command. The CLI schedules a delayed `systemd-run` restart; verify it with a new `vpsops <host> health` call after the delay.
+
 By default the local CLI uses `AIOPS_DEFAULT_PRIVILEGE` from `.env`; this workspace currently uses root to match the VPS admin workflow. Add `--user` for the unprivileged execution path. The CLI follows async jobs, emits stable agent JSON, returns the remote `exit_code`, and retries short `executor_busy` responses. New installs default to `limits.concurrency=2`; use `--lock-key` for mutable operations that must not overlap and `--idempotency-key` for retry-safe requests.
 
 Host configuration supports both the original single-host variables and future host-scoped variables:
@@ -192,6 +205,8 @@ AIOPS_HOST_EXAMPLE_BASE=https://example.com/hidden-aiops-path
 AIOPS_HOST_EXAMPLE_RUN_TOKEN=...
 AIOPS_HOST_EXAMPLE_ROOT_TOKEN=...
 ```
+
+`AIOPS_OUTPUT` accepts `agent-json`, `agent-full`, `json`, or `raw`.
 
 ## Local Smoke Test
 
