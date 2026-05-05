@@ -22,16 +22,28 @@ func logEvent(event string, fields map[string]any) {
 
 func eventLogLine(ts time.Time, event string, fields map[string]any) ([]byte, error) {
 	record := map[string]any{
-		"ts":    ts,
-		"event": event,
+		"ts":       ts,
+		"event":    event,
+		"severity": eventSeverity(event),
 	}
 	for k, v := range fields {
-		if k == "ts" || k == "event" {
+		if k == "ts" || k == "event" || k == "severity" {
 			continue
 		}
 		record[k] = v
 	}
 	return json.Marshal(record)
+}
+
+func eventSeverity(event string) string {
+	switch event {
+	case "run_rejected", "auth_rejected":
+		return "warn"
+	case "job_cleanup_failed", "job_release_failed", "job_result_save_failed", "audit_write_failed":
+		return "error"
+	default:
+		return "info"
+	}
 }
 
 func runRejectFields(auth AuthInfo, r *http.Request, reason string, extras ...any) map[string]any {

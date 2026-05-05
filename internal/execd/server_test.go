@@ -379,6 +379,43 @@ func TestHandleRunReturnsStableBusyErrorCode(t *testing.T) {
 	}
 }
 
+func TestHandleCancelMarksRunningJobCancelRequested(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Tokens = []TokenConfig{{ID: "ai-run", SHA256: SHA256Hex("good-token")}}
+	base := t.TempDir()
+	cfg.Storage.JobDir = filepath.Join(base, "jobs")
+	cfg.Storage.LogDir = filepath.Join(base, "logs")
+	s, err := NewServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := RunRequest{Mode: "shell", Cmd: "sleep 60", Privilege: PrivilegeUser, Cwd: "/tmp", TimeoutSec: 60}
+	if err := normalizeRequest(&req, cfg); err != nil {
+		t.Fatal(err)
+	}
+	j, _, err := s.lifecycle.prepareJob(req, requestHash(req), AuthInfo{TokenID: "ai-run"}, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.lifecycle.markRunning(j)
+
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+j.id+"/cancel", nil)
+	httpReq.SetPathValue("job_id", j.id)
+	httpReq.Header.Set("Authorization", "Bearer good-token")
+	w := httptest.NewRecorder()
+	s.handleCancel(w, httpReq)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	if j.summary().State != StateCanceled {
+		t.Fatalf("expected canceled state, got %+v", j.summary())
+	}
+	if !j.wasCancelRequested() {
+		t.Fatal("expected cancel request to be recorded")
+	}
+}
+
 func TestAuthorizeJobAccessUsesMetadata(t *testing.T) {
 	s := newTestServer(t, 1)
 	req := RunRequest{

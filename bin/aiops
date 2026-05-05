@@ -55,6 +55,12 @@ class AiopsHTTPError(AiopsError):
         super().__init__(f"HTTP {code}: {message}")
 
 
+class AiopsTransportError(AiopsError):
+    def __init__(self, code: str, message: str):
+        self.code = code
+        super().__init__(message)
+
+
 def repo_env_path() -> Path:
     return Path(__file__).resolve().parents[1] / ".env"
 
@@ -217,7 +223,18 @@ def http_json(method: str, url: str, token: str | None = None, body: Any | None 
             payload = {"error": text}
         raise AiopsHTTPError(exc.code, payload) from exc
     except urllib.error.URLError as exc:
-        raise AiopsError(f"request failed: {exc}") from exc
+        reason = str(exc.reason)
+        code = "transport_error"
+        lowered = reason.lower()
+        if "connection refused" in lowered:
+            code = "connection_refused"
+        elif "timed out" in lowered or "timeout" in lowered:
+            code = "connection_timeout"
+        elif "name or service not known" in lowered or "temporary failure in name resolution" in lowered:
+            code = "dns_error"
+        elif "ssl" in lowered or "tls" in lowered or "certificate" in lowered:
+            code = "tls_error"
+        raise AiopsTransportError(code, f"request failed: {exc}") from exc
 
 
 def token_for(host: HostConfig, privilege: str) -> str:
@@ -367,6 +384,8 @@ def agent_error_payload(host: str | None, exc: AiopsError) -> dict[str, Any]:
             retry_after_sec = int(exc.payload.get("retry_after_sec") or 0)
         else:
             code = "http_error"
+    elif isinstance(exc, AiopsTransportError):
+        code = exc.code
     return {
         "schema": "aiops.cli.error.v1",
         "ok": False,
@@ -763,6 +782,114 @@ def command_fleet(env: dict[str, str], rest: list[str]) -> int:
     return return_code
 
 
+def fleet_plan_step_payload(host: HostConfig, phase: str, payload: dict[str, Any]) -> dict[str, Any]:
+    result = agent_result_payload(host, payload)
+    result["phase"] = phase
+    return result
+
+
+def command_fleet_plan(env: dict[str, str], rest: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="aiops fleet-plan", description="Run a gated precheck/apply/postcheck plan across hosts")
+    parser.add_argument("--hosts", default="", help="comma-separated host aliases; default uses AIOPS_HOSTS")
+    parser.add_argument("--precheck", action="append", default=[], help="shell command to run before apply; repeatable")
+    parser.add_argument("--apply", action="append", default=[], help="shell command to apply; repeatable")
+    parser.add_argument("--postcheck", action="append", default=[], help="shell command to run after apply; repeatable")
+    parser.add_argument("--lock-key", default="fleet-plan:default", help="lock key used for apply steps")
+    parser.add_argument("--idempotency-key", default="")
+    parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--wait", type=int, default=DEFAULT_WAIT)
+    parser.add_argument("--kill-grace", type=int, default=3)
+    parser.add_argument("--busy-retries", type=int, default=6)
+    parser.add_argument("--max-stdout-bytes", type=int, default=262144)
+    parser.add_argument("--max-stderr-bytes", type=int, default=262144)
+    parser.add_argument("--max-stdout-log-bytes", type=int, default=1048576)
+    parser.add_argument("--max-stderr-log-bytes", type=int, default=1048576)
+    parser.add_argument("--parallel", type=int, default=1, help="reserved; fleet-plan currently runs serially")
+    add_output_options(parser)
+    args = parser.parse_args(rest)
+    validate_run_options(args)
+    require_int_range("--parallel", args.parallel, min_value=1, max_value=1)
+    if not args.apply:
+        raise AiopsError("fleet-plan requires at least one --apply command")
+    if args.lock_key:
+        require_safe_name("lock key", args.lock_key)
+    host_names = split_csv(args.hosts) if args.hosts else known_hosts(env)
+    if not host_names:
+        raise AiopsError("fleet-plan requires --hosts or AIOPS_HOSTS")
+
+    class RunArgs:
+        root = True
+        user = False
+        cwd = "/"
+        kill_grace = 3
+        max_stdout_bytes = 262144
+        max_stderr_bytes = 262144
+        max_stdout_log_bytes = 1048576
+        max_stderr_log_bytes = 1048576
+        idempotency_key = ""
+
+    run_args = RunArgs()
+    run_args.timeout = args.timeout
+    run_args.wait = min(args.wait, args.timeout)
+    run_args.kill_grace = args.kill_grace
+    run_args.max_stdout_bytes = args.max_stdout_bytes
+    run_args.max_stderr_bytes = args.max_stderr_bytes
+    run_args.max_stdout_log_bytes = args.max_stdout_log_bytes
+    run_args.max_stderr_log_bytes = args.max_stderr_log_bytes
+    run_args.idempotency_key = args.idempotency_key
+
+    phases = [
+        ("precheck", args.precheck, ""),
+        ("apply", args.apply, args.lock_key),
+        ("postcheck", args.postcheck, ""),
+    ]
+    overall_ok = True
+    host_results: list[dict[str, Any]] = []
+    return_code = 0
+    for input_host in host_names:
+        host = host_config(input_host, env)
+        steps: list[dict[str, Any]] = []
+        host_ok = True
+        for phase, commands, lock_key in phases:
+            for command in commands:
+                run_args.lock_key = lock_key
+                req = base_run_request(run_args, command, host)
+                payload = execute_remote(host, req, follow=True, busy_retries=args.busy_retries)
+                step = fleet_plan_step_payload(host, phase, payload)
+                steps.append(step)
+                if not step["ok"]:
+                    host_ok = False
+                    overall_ok = False
+                    exit_code = int(step.get("exit_code", 1))
+                    if return_code == 0:
+                        return_code = exit_code if 1 <= exit_code <= 125 else 1
+                    break
+            if not host_ok:
+                break
+        host_results.append({"host": host.name, "ok": host_ok, "steps": steps})
+        if not host_ok:
+            break
+
+    if selected_output_mode(args, HostConfig("", "", "", "", "root", output_mode=default_output_mode(env))) == OUTPUT_RAW:
+        for host_result in host_results:
+            print(f"===== {host_result['host']} =====")
+            for step in host_result["steps"]:
+                print(f"{step['phase']}: ok={step['ok']} job_id={step.get('job_id')}")
+                stdout = step.get("stdout") or ""
+                stderr = step.get("stderr") or ""
+                if stdout:
+                    sys.stdout.write(stdout)
+                    if not stdout.endswith("\n"):
+                        sys.stdout.write("\n")
+                if stderr:
+                    sys.stderr.write(stderr)
+                    if not stderr.endswith("\n"):
+                        sys.stderr.write("\n")
+    else:
+        print_json_object({"schema": "aiops.cli.fleet_plan.v1", "ok": overall_ok, "hosts": host_results})
+    return return_code
+
+
 def command_health(host: HostConfig) -> int:
     _, payload = http_json("GET", host.base + "/healthz", timeout=15)
     print(json.dumps(payload, ensure_ascii=False))
@@ -770,6 +897,19 @@ def command_health(host: HostConfig) -> int:
 
 
 def command_job(host: HostConfig, rest: list[str]) -> int:
+    if rest and rest[0] == "cancel":
+        parser = argparse.ArgumentParser(prog="aiops <host> job cancel")
+        parser.add_argument("job_id")
+        parser.add_argument("--user", action="store_true")
+        parser.add_argument("--json", action="store_true")
+        args = parser.parse_args(rest[1:])
+        token = host.run_token if args.user else host.root_token
+        _, payload = http_json("POST", host.base + f"/v1/jobs/{urllib.parse.quote(args.job_id)}/cancel", token, timeout=30)
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print_json_object(agent_job_payload(host, payload))
+        return 0
     parser = argparse.ArgumentParser(prog="aiops <host> job")
     parser.add_argument("job_id")
     parser.add_argument("--user", action="store_true")
@@ -961,6 +1101,55 @@ def command_service(host: HostConfig, rest: list[str]) -> int:
     raise AiopsError(f"unsupported service action: {action}")
 
 
+def command_doctor(host: HostConfig, rest: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="aiops <host> doctor")
+    parser.add_argument("--config", default="/etc/aiops-execd/config.json")
+    parser.add_argument("--no-probe", action="store_true", help="skip sudo/helper fd3 probe")
+    add_output_options(parser)
+    args = parser.parse_args(rest)
+    cmd = "aiops-execd -doctor"
+    if not args.no_probe:
+        cmd += " -doctor-probe"
+    cmd += f" --config {quoted(args.config)}"
+
+    class RunArgs:
+        root = True
+        user = False
+        cwd = "/"
+        timeout = 60
+        wait = DEFAULT_WAIT
+        kill_grace = 3
+        max_stdout_bytes = 262144
+        max_stderr_bytes = 262144
+        max_stdout_log_bytes = 1048576
+        max_stderr_log_bytes = 1048576
+        lock_key = "aiops:doctor"
+        idempotency_key = ""
+
+    req = base_run_request(RunArgs(), cmd, host)
+    return run_remote(host, req, follow=True, output_mode=selected_output_mode(args, host))
+
+
+def command_ops(host: HostConfig, rest: list[str]) -> int:
+    if not rest:
+        raise AiopsError("ops recipe required: ssh-surface")
+    recipe = rest[0]
+    parser = argparse.ArgumentParser(prog=f"aiops <host> ops {recipe}")
+    add_output_options(parser)
+    args = parser.parse_args(rest[1:])
+    if recipe == "ssh-surface":
+        cmd = r"""set -e
+echo '## sshd effective ports'
+sshd -T | grep '^port '
+echo '## ssh listeners'
+ss -lntp 'sport = :22 or sport = :2222 or sport = :22022' || true
+echo '## ufw ssh rules'
+ufw status numbered | awk '/22\/tcp|2222\/tcp/ {print}' || true
+"""
+        return run_builtin(host, cmd, timeout=30, output_mode=selected_output_mode(args, host))
+    raise AiopsError(f"unsupported ops recipe: {recipe}")
+
+
 def command_file(host: HostConfig, rest: list[str]) -> int:
     if len(rest) < 2 or rest[0] != "read":
         raise AiopsError("usage: aiops <host> file read <path> [--max-bytes N] [--raw|--json|--agent-json]")
@@ -976,10 +1165,35 @@ def command_file(host: HostConfig, rest: list[str]) -> int:
     return run_builtin(host, cmd, timeout=30, output_mode=selected_output_mode(args, host))
 
 
-def command_hosts(env: dict[str, str]) -> int:
+def host_registry_payload(env: dict[str, str]) -> dict[str, Any]:
     hosts = known_hosts(env)
     if not hosts and env.get("AIOPS_HTTPS_BASE"):
         hosts = [env.get("AIOPS_DEFAULT_HOST", "default")]
+    items = []
+    for host in hosts:
+        key = sanitize_host(host)
+        items.append(
+            {
+                "name": host,
+                "aliases": split_csv(env.get(f"AIOPS_HOST_{key}_ALIASES", "")),
+                "base": env.get(f"AIOPS_HOST_{key}_BASE") or env.get("AIOPS_HTTPS_BASE", ""),
+                "default_privilege": env.get(f"AIOPS_HOST_{key}_DEFAULT_PRIVILEGE") or env.get("AIOPS_DEFAULT_PRIVILEGE", "root"),
+                "has_run_token": bool(env.get(f"AIOPS_HOST_{key}_RUN_TOKEN") or env.get("AIOPS_RUN_TOKEN")),
+                "has_root_token": bool(env.get(f"AIOPS_HOST_{key}_ROOT_TOKEN") or env.get("AIOPS_ROOT_TOKEN")),
+            }
+        )
+    return {"schema": "aiops.cli.hosts.v1", "env_file": env.get("AIOPS_ENV_FILE_RESOLVED", ""), "hosts": items}
+
+
+def command_hosts(env: dict[str, str], rest: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="aiops hosts")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(rest or [])
+    payload = host_registry_payload(env)
+    if args.json:
+        print_json_object(payload)
+        return 0
+    hosts = [item["name"] for item in payload["hosts"]]
     for host in hosts:
         aliases = split_csv(env.get(f"AIOPS_HOST_{sanitize_host(host)}_ALIASES", ""))
         suffix = f" aliases={','.join(aliases)}" if aliases else ""
@@ -990,6 +1204,7 @@ def command_hosts(env: dict[str, str]) -> int:
 def usage() -> str:
     return """Usage:
   aiops hosts
+  aiops fleet-plan --hosts jp,la --precheck <cmd> --apply <cmd> --postcheck <cmd>
   aiops fleet [--hosts jp,la] [--parallel N] [--raw|--json|--agent-json|--output PROFILE] -- <cmd>
   aiops <host> health
   aiops <host> [--root|--user] [--cwd DIR] [--timeout SEC] [--raw|--json|--agent-json|--output PROFILE] [--lock-key KEY] [--idempotency-key KEY] -- <cmd>
@@ -998,8 +1213,11 @@ def usage() -> str:
   aiops <host> docker ps [--all]
   aiops <host> docker logs <container> [--tail N]
   aiops <host> service status|restart <name>
+  aiops <host> doctor [--no-probe]
+  aiops <host> ops ssh-surface
   aiops <host> file read <absolute-path> [--max-bytes N]
   aiops <host> job <job_id> [--json]
+  aiops <host> job cancel <job_id>
   aiops <host> stdout|stderr <job_id> [--tail-bytes N]
 """
 
@@ -1014,7 +1232,9 @@ def main(argv: list[str]) -> int:
         env = merged_env()
         err_mode = error_output_mode(argv, env)
         if argv[0] == "hosts":
-            return command_hosts(env)
+            return command_hosts(env, argv[1:])
+        if argv[0] == "fleet-plan":
+            return command_fleet_plan(env, argv[1:])
         if argv[0] == "fleet":
             return command_fleet(env, argv[1:])
         host = host_config(argv[0], env)
@@ -1034,6 +1254,10 @@ def main(argv: list[str]) -> int:
             return command_docker(host, rest[1:])
         if rest[0] == "service":
             return command_service(host, rest[1:])
+        if rest[0] == "doctor":
+            return command_doctor(host, rest[1:])
+        if rest[0] == "ops":
+            return command_ops(host, rest[1:])
         if rest[0] == "file":
             return command_file(host, rest[1:])
         if rest[0] == "job":

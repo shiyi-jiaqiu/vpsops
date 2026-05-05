@@ -155,9 +155,13 @@ vpsops jp --raw -- hostname
 vpsops jp --user -- id -un
 vpsops jp batch --cmd 'hostname' --cmd 'uptime' --cmd 'df -h /'
 vpsops fleet --hosts jp,la,sg,gcp --parallel 2 -- hostname
+vpsops fleet-plan --hosts jp,la --precheck 'sshd -t' --apply 'systemctl reload ssh' --postcheck 'systemctl is-active ssh'
 vpsops la docker ps
 vpsops sg service status aiops-execd
 vpsops jp service restart aiops-execd
+vpsops jp doctor
+vpsops jp ops ssh-surface
+vpsops jp job cancel <job_id>
 vpsops gcp file read /etc/hostname
 ```
 
@@ -187,6 +191,12 @@ vpsops <host> batch \
 `batch` runs commands sequentially inside one remote job. By default it continues after failed steps so diagnostics are not lost, but the final exit code is non-zero if any step failed. Use `--stop-on-error` for deployment/update sequences where later steps must not run after a failure. In default agent JSON mode, `batch` includes per-step status in `steps`.
 
 `fleet` runs one command across multiple configured hosts and emits one `aiops.cli.fleet.v1` object with per-host results. Use it for read-only fan-out checks; keep mutable fleet operations guarded with `--lock-key` and conservative `--parallel` values.
+
+`fleet-plan` runs a gated serial plan across hosts: all `--precheck` commands, then `--apply` commands under a shared lock key, then `--postcheck` commands. It stops on the first failed step and emits one `aiops.cli.fleet_plan.v1` object. Use it for small live changes where the order and failure behavior matter more than parallel speed.
+
+`doctor` runs the daemon deployment self-check on a host through `vpsops`, including the sudo/helper fd 3 probe by default. `ops ssh-surface` is a read-only recipe for checking effective SSH ports, listeners, and UFW SSH rules.
+
+`job cancel <job_id>` requests cancellation for a queued or running job. The daemon marks the job as `canceled` and cancels its execution context when the runner is active.
 
 `service restart aiops-execd` is special-cased because a direct restart kills the job currently carrying the command. The CLI schedules a delayed `systemd-run` restart; verify it with a new `vpsops <host> health` call after the delay.
 

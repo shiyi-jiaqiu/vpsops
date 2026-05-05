@@ -22,8 +22,25 @@ func TestEventLogLineIsStructuredJSON(t *testing.T) {
 	if record["event"] != "job_finished" || record["job_id"] != "20260429T120000-event" {
 		t.Fatalf("unexpected event record: %#v", record)
 	}
+	if record["severity"] != "info" {
+		t.Fatalf("expected default info severity, got %#v", record)
+	}
 	if record["ts"] == "ignored" {
 		t.Fatalf("caller fields should not override reserved ts: %#v", record)
+	}
+}
+
+func TestEventLogLineInfersWarningSeverityForRejectedRuns(t *testing.T) {
+	line, err := eventLogLine(time.Unix(1, 0).UTC(), "run_rejected", map[string]any{"reason": "executor_busy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record map[string]any
+	if err := json.Unmarshal(line, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record["severity"] != "warn" {
+		t.Fatalf("expected warn severity, got %#v", record)
 	}
 }
 

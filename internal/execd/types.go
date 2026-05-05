@@ -11,6 +11,7 @@ const (
 	StateSucceeded   = "succeeded"
 	StateFailed      = "failed"
 	StateTimedOut    = "timed_out"
+	StateCanceled    = "canceled"
 	StateStartFailed = "start_failed"
 )
 

@@ -52,6 +52,7 @@ func NewServer(cfg Config) (*Server, error) {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("POST /v1/run", s.handleRun)
 	mux.HandleFunc("GET /v1/jobs/{job_id}", s.handleJob)
+	mux.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.handleCancel)
 	mux.HandleFunc("GET /v1/jobs/{job_id}/stdout", s.handleOutput("stdout.log"))
 	mux.HandleFunc("GET /v1/jobs/{job_id}/stderr", s.handleOutput("stderr.log"))
 	s.http = &http.Server{
@@ -164,7 +165,13 @@ func (s *Server) runJob(j *job, req RunRequest) {
 	logEvent("job_started", jobEventFields(j, req))
 	ctx, cancel := helperContext(req)
 	defer cancel()
+	j.setCancel(cancel)
 	res := runViaChild(ctx, s.cfg, s.store, j.id, req)
+	if j.wasCancelRequested() {
+		res.State = StateCanceled
+		res.ExitCode = -1
+		res.Error = "job canceled"
+	}
 	if err := s.store.SaveResult(res); err != nil {
 		logEvent("job_result_save_failed", map[string]any{"job_id": j.id, "error": err.Error()})
 	}
@@ -210,6 +217,37 @@ func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, JobSummary{JobID: jobID, State: res.State, StartedAt: res.StartedAt, FinishedAt: &res.FinishedAt, Result: &res})
+}
+
+func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
+	auth, ok := s.authenticateRequest(w, r)
+	if !ok {
+		return
+	}
+	jobID := r.PathValue("job_id")
+	if !jobIDRe.MatchString(jobID) {
+		writeError(w, http.StatusBadRequest, "invalid_job_id", "invalid job_id")
+		return
+	}
+	allowed, err := s.authorizeJobAccess(auth, jobID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "job_not_found", "job not found")
+		return
+	}
+	if !allowed {
+		writeError(w, http.StatusForbidden, "forbidden", "forbidden")
+		return
+	}
+	j, err := s.lifecycle.cancelJob(jobID)
+	if err != nil {
+		if errors.Is(err, errJobNotCancelable) {
+			writeError(w, http.StatusConflict, "job_not_cancelable", "job is not cancelable")
+			return
+		}
+		writeError(w, http.StatusNotFound, "job_not_found", "job not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, j.summary())
 }
 
 func (s *Server) handleOutput(name string) http.HandlerFunc {

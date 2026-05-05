@@ -35,6 +35,36 @@ class AiopsCliTest(unittest.TestCase):
         self.assertEqual(host.base, "https://jp.example/hidden")
         self.assertEqual(host.default_privilege, "user")
 
+    def test_hosts_json_reports_configured_hosts_without_tokens(self) -> None:
+        env = {
+            "AIOPS_ENV_FILE_RESOLVED": ".env.test",
+            "AIOPS_DEFAULT_HOST": "jp",
+            "AIOPS_HOSTS": "jp,sg",
+            "AIOPS_HOST_JP_ALIASES": "j,jp1",
+            "AIOPS_HOST_JP_BASE": "https://jp.example/hidden",
+            "AIOPS_HOST_JP_RUN_TOKEN": "run-secret",
+            "AIOPS_HOST_JP_ROOT_TOKEN": "root-secret",
+            "AIOPS_HOST_SG_BASE": "https://sg.example/hidden",
+            "AIOPS_HOST_SG_RUN_TOKEN": "sg-run",
+            "AIOPS_HOST_SG_ROOT_TOKEN": "sg-root",
+            "AIOPS_DEFAULT_PRIVILEGE": "root",
+        }
+
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "stdout", stdout):
+            rc = aiops.command_hosts(env, ["--json"])
+
+        self.assertEqual(rc, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["schema"], "aiops.cli.hosts.v1")
+        self.assertEqual(payload["env_file"], ".env.test")
+        self.assertEqual([item["name"] for item in payload["hosts"]], ["jp", "sg"])
+        self.assertEqual(payload["hosts"][0]["aliases"], ["j", "jp1"])
+        self.assertTrue(payload["hosts"][0]["has_run_token"])
+        self.assertTrue(payload["hosts"][0]["has_root_token"])
+        self.assertNotIn("run-secret", stdout.getvalue())
+        self.assertNotIn("root-secret", stdout.getvalue())
+
     def test_batch_script_preserves_each_command_as_one_step(self) -> None:
         script = aiops.batch_script(["printf '%s\\n' ok", "false"], stop_on_error=False)
 
@@ -227,6 +257,15 @@ class AiopsCliTest(unittest.TestCase):
         self.assertEqual(payload["http_status"], 409)
         self.assertEqual(payload["retry_after_sec"], 1)
         self.assertEqual(payload["message"], "executor is busy")
+
+    def test_agent_error_classifies_transport_failures(self) -> None:
+        payload = aiops.agent_error_payload("jp", aiops.AiopsTransportError("connection_refused", "request failed: refused"))
+
+        self.assertEqual(payload["schema"], "aiops.cli.error.v1")
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["host"], "jp")
+        self.assertEqual(payload["code"], "connection_refused")
+        self.assertEqual(payload["http_status"], 0)
 
     def test_remote_command_raw_argument_does_not_disable_agent_json_errors(self) -> None:
         env = {
@@ -505,6 +544,33 @@ class AiopsCliTest(unittest.TestCase):
         self.assertEqual(payload["job_id"], "job-queued")
         self.assertEqual(payload["state"], "queued")
 
+    def test_job_cancel_posts_cancel_endpoint(self) -> None:
+        host = aiops.HostConfig(
+            name="jp",
+            base="https://jp.example/hidden",
+            run_token="run",
+            root_token="root",
+            default_privilege="root",
+        )
+        seen = {}
+
+        def fake_http_json(method, url, token=None, body=None, timeout=30):
+            seen.update({"method": method, "url": url, "token": token})
+            return 200, {"job_id": "job-queued", "state": "canceled", "started_at": "2026-05-05T00:00:00Z"}
+
+        with mock.patch.object(aiops, "http_json", side_effect=fake_http_json):
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout):
+                rc = aiops.command_job(host, ["cancel", "job-queued"])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen["method"], "POST")
+        self.assertTrue(seen["url"].endswith("/v1/jobs/job-queued/cancel"))
+        self.assertEqual(seen["token"], "root")
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["schema"], "aiops.cli.job.v1")
+        self.assertEqual(payload["state"], "canceled")
+
     def test_deploy_verify_forces_raw_vpsops_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             fakebin = Path(tmp) / "bin"
@@ -666,6 +732,74 @@ else:
         self.assertIn("/bin/systemctl restart aiops-execd", seen_body["cmd"])
         self.assertNotIn("systemctl restart aiops-execd && systemctl is-active aiops-execd", seen_body["cmd"])
 
+    def test_remote_doctor_runs_daemon_doctor_probe(self) -> None:
+        host = aiops.HostConfig(
+            name="jp",
+            base="https://jp.example/hidden",
+            run_token="run",
+            root_token="root",
+            default_privilege="root",
+        )
+        seen_body = {}
+
+        def fake_http_json(method, url, token=None, body=None, timeout=30):
+            seen_body.update(body)
+            return 200, {
+                "job_id": "job-doctor",
+                "state": "succeeded",
+                "exit_code": 0,
+                "stdout": "[PASS] config: loaded /etc/aiops-execd/config.json\n",
+                "stderr": "",
+                "duration_ms": 12,
+            }
+
+        with mock.patch.object(aiops, "http_json", side_effect=fake_http_json):
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout):
+                rc = aiops.command_doctor(host, [])
+
+        self.assertEqual(rc, 0)
+        self.assertIn("aiops-execd -doctor -doctor-probe", seen_body["cmd"])
+        self.assertEqual(seen_body["lock_key"], "aiops:doctor")
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["schema"], "aiops.cli.result.v1")
+        self.assertTrue(payload["ok"])
+        self.assertIn("[PASS] config", payload["stdout"])
+
+    def test_ops_ssh_surface_checks_effective_port_listeners_and_ufw(self) -> None:
+        host = aiops.HostConfig(
+            name="jp",
+            base="https://jp.example/hidden",
+            run_token="run",
+            root_token="root",
+            default_privilege="root",
+        )
+        seen_body = {}
+
+        def fake_http_json(method, url, token=None, body=None, timeout=30):
+            seen_body.update(body)
+            return 200, {
+                "job_id": "job-ssh-surface",
+                "state": "succeeded",
+                "exit_code": 0,
+                "stdout": "port 2222\n",
+                "stderr": "",
+                "duration_ms": 12,
+            }
+
+        with mock.patch.object(aiops, "http_json", side_effect=fake_http_json):
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout):
+                rc = aiops.command_ops(host, ["ssh-surface"])
+
+        self.assertEqual(rc, 0)
+        self.assertIn("sshd -T", seen_body["cmd"])
+        self.assertIn("sport = :22 or sport = :2222 or sport = :22022", seen_body["cmd"])
+        self.assertIn("ufw status numbered", seen_body["cmd"])
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["schema"], "aiops.cli.result.v1")
+        self.assertTrue(payload["ok"])
+
     def test_fleet_command_returns_one_agent_json_summary(self) -> None:
         env = {
             "AIOPS_ENV_FILE_RESOLVED": ".env.test",
@@ -701,6 +835,172 @@ else:
         self.assertEqual([item["host"] for item in payload["results"]], ["jp", "sg"])
         self.assertEqual([item["stdout"] for item in payload["results"]], ["jp\n", "sg\n"])
         self.assertNotIn("exit_code", payload["results"][0])
+
+    def test_fleet_plan_runs_precheck_apply_postcheck_with_lock(self) -> None:
+        env = {
+            "AIOPS_ENV_FILE_RESOLVED": ".env.test",
+            "AIOPS_DEFAULT_HOST": "jp",
+            "AIOPS_HOSTS": "jp,sg",
+            "AIOPS_HOST_JP_BASE": "https://jp.example/hidden",
+            "AIOPS_HOST_JP_RUN_TOKEN": "jp-run",
+            "AIOPS_HOST_JP_ROOT_TOKEN": "jp-root",
+            "AIOPS_HOST_SG_BASE": "https://sg.example/hidden",
+            "AIOPS_HOST_SG_RUN_TOKEN": "sg-run",
+            "AIOPS_HOST_SG_ROOT_TOKEN": "sg-root",
+            "AIOPS_DEFAULT_PRIVILEGE": "root",
+        }
+        calls = []
+
+        def fake_http_json(method, url, token=None, body=None, timeout=30):
+            host = "jp" if "jp.example" in url else "sg"
+            calls.append((host, body["cmd"], body.get("lock_key", ""), token))
+            return 200, {
+                "job_id": f"job-{host}-{len(calls)}",
+                "state": "succeeded",
+                "exit_code": 0,
+                "stdout": f"{host}:{body['cmd']}\n",
+                "stderr": "",
+                "duration_ms": 10,
+            }
+
+        with mock.patch.object(aiops, "merged_env", return_value=env), mock.patch.object(aiops, "http_json", side_effect=fake_http_json):
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout):
+                rc = aiops.main(
+                    [
+                        "fleet-plan",
+                        "--hosts",
+                        "jp,sg",
+                        "--precheck",
+                        "test-pre",
+                        "--apply",
+                        "test-apply",
+                        "--postcheck",
+                        "test-post",
+                    ]
+                )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            [(host, cmd, lock) for host, cmd, lock, _token in calls],
+            [
+                ("jp", "test-pre", ""),
+                ("jp", "test-apply", "fleet-plan:default"),
+                ("jp", "test-post", ""),
+                ("sg", "test-pre", ""),
+                ("sg", "test-apply", "fleet-plan:default"),
+                ("sg", "test-post", ""),
+            ],
+        )
+        self.assertTrue(all(token.endswith("-root") for *_rest, token in calls))
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["schema"], "aiops.cli.fleet_plan.v1")
+        self.assertTrue(payload["ok"])
+        self.assertEqual([item["host"] for item in payload["hosts"]], ["jp", "sg"])
+        self.assertEqual([step["phase"] for step in payload["hosts"][0]["steps"]], ["precheck", "apply", "postcheck"])
+
+    def test_fleet_plan_stops_before_apply_when_precheck_fails(self) -> None:
+        env = {
+            "AIOPS_ENV_FILE_RESOLVED": ".env.test",
+            "AIOPS_DEFAULT_HOST": "jp",
+            "AIOPS_HOSTS": "jp,sg",
+            "AIOPS_HOST_JP_BASE": "https://jp.example/hidden",
+            "AIOPS_HOST_JP_RUN_TOKEN": "jp-run",
+            "AIOPS_HOST_JP_ROOT_TOKEN": "jp-root",
+            "AIOPS_HOST_SG_BASE": "https://sg.example/hidden",
+            "AIOPS_HOST_SG_RUN_TOKEN": "sg-run",
+            "AIOPS_HOST_SG_ROOT_TOKEN": "sg-root",
+            "AIOPS_DEFAULT_PRIVILEGE": "root",
+        }
+        calls = []
+
+        def fake_http_json(method, url, token=None, body=None, timeout=30):
+            host = "jp" if "jp.example" in url else "sg"
+            calls.append((host, body["cmd"]))
+            return 200, {
+                "job_id": "job-failed-precheck",
+                "state": "failed",
+                "exit_code": 7,
+                "stdout": "",
+                "stderr": "precheck failed\n",
+                "duration_ms": 10,
+            }
+
+        with mock.patch.object(aiops, "merged_env", return_value=env), mock.patch.object(aiops, "http_json", side_effect=fake_http_json):
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout):
+                rc = aiops.main(["fleet-plan", "--hosts", "jp,sg", "--precheck", "test-pre", "--apply", "test-apply"])
+
+        self.assertEqual(rc, 7)
+        self.assertEqual(calls, [("jp", "test-pre")])
+        payload = json.loads(stdout.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["hosts"][0]["host"], "jp")
+        self.assertFalse(payload["hosts"][0]["ok"])
+        self.assertEqual([step["phase"] for step in payload["hosts"][0]["steps"]], ["precheck"])
+
+    def test_fleet_plan_honors_run_control_options(self) -> None:
+        env = {
+            "AIOPS_ENV_FILE_RESOLVED": ".env.test",
+            "AIOPS_DEFAULT_HOST": "jp",
+            "AIOPS_HOSTS": "jp",
+            "AIOPS_HOST_JP_BASE": "https://jp.example/hidden",
+            "AIOPS_HOST_JP_RUN_TOKEN": "jp-run",
+            "AIOPS_HOST_JP_ROOT_TOKEN": "jp-root",
+            "AIOPS_DEFAULT_PRIVILEGE": "root",
+        }
+        seen_bodies = []
+
+        def fake_http_json(method, url, token=None, body=None, timeout=30):
+            seen_bodies.append(dict(body))
+            return 200, {
+                "job_id": "job-jp",
+                "state": "succeeded",
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+                "duration_ms": 10,
+            }
+
+        with mock.patch.object(aiops, "merged_env", return_value=env), mock.patch.object(aiops, "http_json", side_effect=fake_http_json):
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout):
+                rc = aiops.main(
+                    [
+                        "fleet-plan",
+                        "--hosts",
+                        "jp",
+                        "--apply",
+                        "test-apply",
+                        "--timeout",
+                        "45",
+                        "--wait",
+                        "12",
+                        "--kill-grace",
+                        "8",
+                        "--max-stdout-bytes",
+                        "1234",
+                        "--max-stderr-bytes",
+                        "2345",
+                        "--max-stdout-log-bytes",
+                        "3456",
+                        "--max-stderr-log-bytes",
+                        "4567",
+                        "--idempotency-key",
+                        "fleet-plan-test-1",
+                    ]
+                )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(seen_bodies), 1)
+        self.assertEqual(seen_bodies[0]["timeout_sec"], 45)
+        self.assertEqual(seen_bodies[0]["wait_sec"], 12)
+        self.assertEqual(seen_bodies[0]["kill_grace_sec"], 8)
+        self.assertEqual(seen_bodies[0]["max_stdout_bytes"], 1234)
+        self.assertEqual(seen_bodies[0]["max_stderr_bytes"], 2345)
+        self.assertEqual(seen_bodies[0]["max_stdout_log_bytes"], 3456)
+        self.assertEqual(seen_bodies[0]["max_stderr_log_bytes"], 4567)
+        self.assertEqual(seen_bodies[0]["idempotency_key"], "fleet-plan-test-1")
 
 
 if __name__ == "__main__":

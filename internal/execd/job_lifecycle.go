@@ -1,7 +1,9 @@
 package execd
 
 import (
+	"context"
 	"errors"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -12,27 +14,62 @@ var (
 	errLockBusy             = errors.New("lock busy")
 	errIdempotencyConflict  = errors.New("idempotency key reused with different request")
 	errConcurrencySlotPanic = errors.New("job lifecycle concurrency slot is empty")
+	errJobNotCancelable     = errors.New("job is not cancelable")
 )
 
 type job struct {
-	id      string
-	state   string
-	result  *RunResult
-	done    chan struct{}
-	started time.Time
-	hash    string
-	tokenID string
-	remote  string
-	lockKey string
-	mu      sync.Mutex
+	id              string
+	state           string
+	result          *RunResult
+	done            chan struct{}
+	started         time.Time
+	hash            string
+	tokenID         string
+	remote          string
+	lockKey         string
+	cancel          context.CancelFunc
+	cancelRequested bool
+	mu              sync.Mutex
 }
 
 func (j *job) setResult(res RunResult) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.result != nil {
+		return
+	}
 	j.result = &res
 	j.state = res.State
 	close(j.done)
+}
+
+func (j *job) setCancel(cancel context.CancelFunc) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.cancel = cancel
+	if j.cancelRequested && j.cancel != nil {
+		j.cancel()
+	}
+}
+
+func (j *job) requestCancel() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.result != nil {
+		return false
+	}
+	j.cancelRequested = true
+	j.state = StateCanceled
+	if j.cancel != nil {
+		j.cancel()
+	}
+	return true
+}
+
+func (j *job) wasCancelRequested() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.cancelRequested
 }
 
 func (j *job) summary() JobSummary {
@@ -153,6 +190,11 @@ func (l *jobLifecycle) prepareJob(req RunRequest, reqHash string, auth AuthInfo,
 
 func (l *jobLifecycle) markRunning(j *job) {
 	j.mu.Lock()
+	if j.cancelRequested {
+		j.state = StateCanceled
+		j.mu.Unlock()
+		return
+	}
 	j.state = StateRunning
 	j.mu.Unlock()
 }
@@ -164,6 +206,17 @@ func (l *jobLifecycle) releaseJob(j *job) error {
 		delete(l.locks, j.lockKey)
 	}
 	return l.releaseSlotLocked()
+}
+
+func (l *jobLifecycle) cancelJob(jobID string) (*job, error) {
+	j := l.getJob(jobID)
+	if j == nil {
+		return nil, os.ErrNotExist
+	}
+	if !j.requestCancel() {
+		return nil, errJobNotCancelable
+	}
+	return j, nil
 }
 
 func (l *jobLifecycle) releaseSlotLocked() error {

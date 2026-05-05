@@ -153,3 +153,25 @@ func TestJobLifecycleDetectsDoubleRelease(t *testing.T) {
 		t.Fatalf("expected double release guard, got %v", err)
 	}
 }
+
+func TestJobCancelBeforeRunnerStartsCancelsWhenRunnerBindsContext(t *testing.T) {
+	l := newTestLifecycle(t, 1)
+	req := normalizedLifecycleRequest(t, "sleep 60")
+	j, _, err := l.prepareJob(req, requestHash(req), AuthInfo{TokenID: "ai-run"}, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.cancelJob(j.id); err != nil {
+		t.Fatal(err)
+	}
+	canceled := false
+	j.setCancel(func() { canceled = true })
+	l.markRunning(j)
+
+	if !canceled {
+		t.Fatal("expected cancel func to run when runner binds after cancel request")
+	}
+	if got := j.summary().State; got != StateCanceled {
+		t.Fatalf("expected canceled state to survive markRunning, got %q", got)
+	}
+}
