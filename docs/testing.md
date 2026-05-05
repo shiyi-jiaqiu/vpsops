@@ -18,7 +18,7 @@ bash -n scripts/*.sh bin/vpsops
 - `go test ./...`: unit and package-level behavior, including auth, validation, job store, child execution, doctor checks, and HTTP handler edge cases.
 - `go vet ./...`: common Go correctness checks.
 - `python3 -m py_compile bin/aiops`: local CLI syntax check.
-- `python3 scripts/test-aiops-cli.py`: local CLI behavior checks for host config, compact/default agent JSON output, full agent output, raw overrides, batch step reporting, fleet summaries, fleet plans, remote doctor, operational recipes, self-restart scheduling, job cancellation, control keys, and retry handling.
+- `python3 scripts/test-aiops-cli.py`: local CLI behavior checks for host config, compact/default agent JSON output, decision views, stream previews, full agent output, raw overrides, batch step reporting, fleet summaries, fleet plans, remote doctor, operational recipes, self-restart scheduling, job cancellation, control keys, and retry handling.
 - `bash -n scripts/*.sh bin/vpsops`: shell syntax check for operator scripts and wrappers.
 - `scripts/smoke-local.sh`: end-to-end local daemon test using a temporary server and fake sudo shim.
 

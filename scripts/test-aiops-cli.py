@@ -137,8 +137,9 @@ class AiopsCliTest(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(payload["schema"], "aiops.cli.result.v1")
+        self.assertEqual(payload["schema"], "aiops.cli.result.v2")
         self.assertTrue(payload["ok"])
+        self.assertEqual(payload["summary"], "command succeeded")
         self.assertEqual(payload["host"], "jp")
         self.assertEqual(payload["job_id"], "job-1")
         self.assertNotIn("state", payload)
@@ -181,9 +182,10 @@ class AiopsCliTest(unittest.TestCase):
         self.assertEqual(
             payload,
             {
-                "schema": "aiops.cli.result.v1",
                 "ok": True,
+                "summary": "command succeeded",
                 "host": "jp",
+                "schema": "aiops.cli.result.v2",
                 "job_id": "job-1",
                 "duration_ms": 12,
                 "stdout": "ok\n",
@@ -220,12 +222,70 @@ class AiopsCliTest(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(payload["schema"], "aiops.cli.result.v1")
+        self.assertEqual(payload["schema"], "aiops.cli.result.v2")
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["state"], "succeeded")
         self.assertEqual(payload["exit_code"], 0)
         self.assertEqual(payload["stderr"], "")
         self.assertFalse(payload["stdout_truncated"])
+
+    def test_default_agent_json_summarizes_large_stdout(self) -> None:
+        host = aiops.HostConfig(
+            name="jp",
+            base="https://jp.example/hidden",
+            run_token="run",
+            root_token="root",
+            default_privilege="user",
+        )
+        large_stdout = "\n".join(f"line-{idx:03d}" for idx in range(400)) + "\n"
+
+        def fake_http_json(method, url, token=None, body=None, timeout=30):
+            return 200, {
+                "job_id": "job-large",
+                "state": "succeeded",
+                "exit_code": 0,
+                "stdout": large_stdout,
+                "stderr": "",
+                "duration_ms": 12,
+            }
+
+        with mock.patch.object(aiops, "http_json", side_effect=fake_http_json):
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout):
+                rc = aiops.parse_run(["--", "large-output"], host)
+
+        self.assertEqual(rc, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertNotIn("stdout", payload)
+        self.assertEqual(payload["stdout_bytes"], len(large_stdout.encode("utf-8")))
+        self.assertEqual(payload["stdout_lines"], 400)
+        self.assertTrue(payload["stdout_agent_truncated"])
+        self.assertIn("line-000", payload["stdout_preview"])
+        self.assertIn("line-399", payload["stdout_preview"])
+        self.assertIn("full output", payload["next"])
+
+    def test_agent_full_keeps_large_stdout(self) -> None:
+        host = aiops.HostConfig(
+            name="jp",
+            base="https://jp.example/hidden",
+            run_token="run",
+            root_token="root",
+            default_privilege="user",
+        )
+        large_stdout = "x" * 5000
+
+        def fake_http_json(method, url, token=None, body=None, timeout=30):
+            return 200, {"job_id": "job-large", "state": "succeeded", "exit_code": 0, "stdout": large_stdout, "stderr": ""}
+
+        with mock.patch.object(aiops, "http_json", side_effect=fake_http_json):
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout):
+                rc = aiops.parse_run(["--output", "agent-full", "--", "large-output"], host)
+
+        self.assertEqual(rc, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["stdout"], large_stdout)
+        self.assertNotIn("stdout_preview", payload)
 
     def test_main_can_emit_agent_json_error_for_http_failures(self) -> None:
         env = {
@@ -257,6 +317,37 @@ class AiopsCliTest(unittest.TestCase):
         self.assertEqual(payload["http_status"], 409)
         self.assertEqual(payload["retry_after_sec"], 1)
         self.assertEqual(payload["message"], "executor is busy")
+
+    def test_failed_command_agent_json_includes_decision_hint(self) -> None:
+        host = aiops.HostConfig(
+            name="jp",
+            base="https://jp.example/hidden",
+            run_token="run",
+            root_token="root",
+            default_privilege="user",
+        )
+
+        def fake_http_json(method, url, token=None, body=None, timeout=30):
+            return 200, {
+                "job_id": "job-failed",
+                "state": "failed",
+                "exit_code": 7,
+                "stdout": "",
+                "stderr": "bad\n",
+                "duration_ms": 12,
+            }
+
+        with mock.patch.object(aiops, "http_json", side_effect=fake_http_json):
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout):
+                rc = aiops.parse_run(["--", "false"], host)
+
+        self.assertEqual(rc, 7)
+        payload = json.loads(stdout.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["code"], "command_failed")
+        self.assertFalse(payload["retryable"])
+        self.assertIn("inspect stderr", payload["next"])
 
     def test_agent_error_classifies_transport_failures(self) -> None:
         payload = aiops.agent_error_payload("jp", aiops.AiopsTransportError("connection_refused", "request failed: refused"))
@@ -380,7 +471,7 @@ class AiopsCliTest(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(payload["schema"], "aiops.cli.result.v1")
+        self.assertEqual(payload["schema"], "aiops.cli.result.v2")
         self.assertEqual(payload["stdout"], "ok\n")
 
     def test_agent_json_is_the_default_output(self) -> None:
@@ -404,7 +495,7 @@ class AiopsCliTest(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(payload["schema"], "aiops.cli.result.v1")
+        self.assertEqual(payload["schema"], "aiops.cli.result.v2")
         self.assertEqual(payload["job_id"], "job-default")
         self.assertEqual(payload["stdout"], "ok\n")
 
@@ -762,7 +853,7 @@ else:
         self.assertIn("aiops-execd -doctor -doctor-probe", seen_body["cmd"])
         self.assertEqual(seen_body["lock_key"], "aiops:doctor")
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(payload["schema"], "aiops.cli.result.v1")
+        self.assertEqual(payload["schema"], "aiops.cli.result.v2")
         self.assertTrue(payload["ok"])
         self.assertIn("[PASS] config", payload["stdout"])
 
@@ -782,7 +873,15 @@ else:
                 "job_id": "job-ssh-surface",
                 "state": "succeeded",
                 "exit_code": 0,
-                "stdout": "port 2222\n",
+                "stdout": (
+                    "## sshd effective ports\n"
+                    "port 2222\n"
+                    "## ssh listeners\n"
+                    "LISTEN 0 65535 0.0.0.0:2222 0.0.0.0:* users:((\"sshd\",pid=1,fd=3))\n"
+                    "## ufw ssh rules\n"
+                    "[13] 2222/tcp ALLOW IN Anywhere\n"
+                    "[16] 22/tcp DENY IN Anywhere\n"
+                ),
                 "stderr": "",
                 "duration_ms": 12,
             }
@@ -797,8 +896,88 @@ else:
         self.assertIn("sport = :22 or sport = :2222 or sport = :22022", seen_body["cmd"])
         self.assertIn("ufw status numbered", seen_body["cmd"])
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(payload["schema"], "aiops.cli.result.v1")
+        self.assertEqual(payload["schema"], "aiops.cli.result.v2")
         self.assertTrue(payload["ok"])
+        self.assertEqual(payload["recipe"], "ssh-surface")
+        self.assertEqual(payload["facts"]["effective_ports"], [2222])
+        self.assertEqual(payload["facts"]["listening_ports"], [2222])
+        self.assertEqual(payload["facts"]["ufw"]["allow"], [2222])
+        self.assertEqual(payload["facts"]["ufw"]["deny"], [22])
+        self.assertEqual(payload["facts"]["risk"], "low")
+        self.assertNotIn("stdout", payload)
+
+    def test_agent_json_orders_decision_fields_first(self) -> None:
+        host = aiops.HostConfig(
+            name="jp",
+            base="https://jp.example/hidden",
+            run_token="run",
+            root_token="root",
+            default_privilege="user",
+        )
+
+        def fake_http_json(method, url, token=None, body=None, timeout=30):
+            return 200, {"job_id": "job-order", "state": "succeeded", "exit_code": 0, "stdout": "ok\n", "stderr": ""}
+
+        with mock.patch.object(aiops, "http_json", side_effect=fake_http_json):
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout):
+                rc = aiops.parse_run(["--", "printf ok"], host)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(list(json.loads(stdout.getvalue()).keys())[:4], ["ok", "summary", "host", "schema"])
+
+    def test_view_decision_outputs_only_decision_fields(self) -> None:
+        env = {
+            "AIOPS_ENV_FILE_RESOLVED": ".env.test",
+            "AIOPS_DEFAULT_HOST": "jp",
+            "AIOPS_HOSTS": "jp",
+            "AIOPS_HOST_JP_BASE": "https://jp.example/hidden",
+            "AIOPS_HOST_JP_RUN_TOKEN": "run",
+            "AIOPS_HOST_JP_ROOT_TOKEN": "root",
+            "AIOPS_DEFAULT_PRIVILEGE": "user",
+        }
+
+        def fake_http_json(method, url, token=None, body=None, timeout=30):
+            return 200, {"job_id": "job-decision", "state": "succeeded", "exit_code": 0, "stdout": "large\n" * 100, "stderr": ""}
+
+        with mock.patch.object(aiops, "merged_env", return_value=env), mock.patch.object(aiops, "http_json", side_effect=fake_http_json):
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout):
+                rc = aiops.main(["jp", "--view", "decision", "--", "printf ok"])
+
+        self.assertEqual(rc, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["schema"], "aiops.cli.result.v2")
+        self.assertEqual(list(payload.keys()), ["ok", "summary", "host", "schema", "job_id", "duration_ms"])
+        self.assertNotIn("stdout", payload)
+
+    def test_view_full_and_raw_alias_existing_output_profiles(self) -> None:
+        env = {
+            "AIOPS_ENV_FILE_RESOLVED": ".env.test",
+            "AIOPS_DEFAULT_HOST": "jp",
+            "AIOPS_HOSTS": "jp",
+            "AIOPS_HOST_JP_BASE": "https://jp.example/hidden",
+            "AIOPS_HOST_JP_RUN_TOKEN": "run",
+            "AIOPS_HOST_JP_ROOT_TOKEN": "root",
+            "AIOPS_DEFAULT_PRIVILEGE": "user",
+        }
+
+        def fake_http_json(method, url, token=None, body=None, timeout=30):
+            return 200, {"job_id": "job-view", "state": "succeeded", "exit_code": 0, "stdout": "ok\n", "stderr": ""}
+
+        with mock.patch.object(aiops, "merged_env", return_value=env), mock.patch.object(aiops, "http_json", side_effect=fake_http_json):
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout):
+                rc = aiops.main(["jp", "--view", "full", "--", "printf ok"])
+        self.assertEqual(rc, 0)
+        self.assertIn("exit_code", json.loads(stdout.getvalue()))
+
+        with mock.patch.object(aiops, "merged_env", return_value=env), mock.patch.object(aiops, "http_json", side_effect=fake_http_json):
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout):
+                rc = aiops.main(["jp", "--view", "raw", "--", "printf ok"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(stdout.getvalue(), "ok\n")
 
     def test_fleet_command_returns_one_agent_json_summary(self) -> None:
         env = {
@@ -830,11 +1009,48 @@ else:
 
         self.assertEqual(rc, 0)
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(payload["schema"], "aiops.cli.fleet.v1")
+        self.assertEqual(payload["schema"], "aiops.cli.fleet.v2")
         self.assertTrue(payload["ok"])
+        self.assertEqual(payload["summary"], "2/2 hosts succeeded")
+        self.assertEqual(payload["counts"], {"total": 2, "ok": 2, "failed": 0})
+        self.assertEqual(payload["failed_hosts"], [])
         self.assertEqual([item["host"] for item in payload["results"]], ["jp", "sg"])
         self.assertEqual([item["stdout"] for item in payload["results"]], ["jp\n", "sg\n"])
         self.assertNotIn("exit_code", payload["results"][0])
+
+    def test_fleet_agent_json_summarizes_first_failure(self) -> None:
+        env = {
+            "AIOPS_ENV_FILE_RESOLVED": ".env.test",
+            "AIOPS_DEFAULT_HOST": "jp",
+            "AIOPS_HOSTS": "jp,sg",
+            "AIOPS_HOST_JP_BASE": "https://jp.example/hidden",
+            "AIOPS_HOST_JP_RUN_TOKEN": "jp-run",
+            "AIOPS_HOST_JP_ROOT_TOKEN": "jp-root",
+            "AIOPS_HOST_SG_BASE": "https://sg.example/hidden",
+            "AIOPS_HOST_SG_RUN_TOKEN": "sg-run",
+            "AIOPS_HOST_SG_ROOT_TOKEN": "sg-root",
+            "AIOPS_DEFAULT_PRIVILEGE": "user",
+        }
+
+        def fake_http_json(method, url, token=None, body=None, timeout=30):
+            if "jp.example" in url:
+                return 200, {"job_id": "job-jp", "state": "succeeded", "exit_code": 0, "stdout": "jp\n", "stderr": ""}
+            return 200, {"job_id": "job-sg", "state": "failed", "exit_code": 3, "stdout": "", "stderr": "bad\n"}
+
+        with mock.patch.object(aiops, "merged_env", return_value=env), mock.patch.object(aiops, "http_json", side_effect=fake_http_json):
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout):
+                rc = aiops.main(["fleet", "--hosts", "jp,sg", "--parallel", "2", "--", "hostname"])
+
+        self.assertEqual(rc, 3)
+        payload = json.loads(stdout.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["summary"], "1/2 hosts failed")
+        self.assertEqual(payload["counts"], {"total": 2, "ok": 1, "failed": 1})
+        self.assertEqual(payload["failed_hosts"], ["sg"])
+        self.assertEqual(payload["first_failure"]["host"], "sg")
+        self.assertEqual(payload["first_failure"]["code"], "command_failed")
+        self.assertIn("command exited", payload["first_failure"]["summary"])
 
     def test_fleet_plan_runs_precheck_apply_postcheck_with_lock(self) -> None:
         env = {
@@ -894,8 +1110,10 @@ else:
         )
         self.assertTrue(all(token.endswith("-root") for *_rest, token in calls))
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(payload["schema"], "aiops.cli.fleet_plan.v1")
+        self.assertEqual(payload["schema"], "aiops.cli.fleet_plan.v2")
         self.assertTrue(payload["ok"])
+        self.assertEqual(payload["summary"], "2/2 hosts completed")
+        self.assertEqual(payload["counts"], {"total": 2, "ok": 2, "failed": 0})
         self.assertEqual([item["host"] for item in payload["hosts"]], ["jp", "sg"])
         self.assertEqual([step["phase"] for step in payload["hosts"][0]["steps"]], ["precheck", "apply", "postcheck"])
 
@@ -935,6 +1153,10 @@ else:
         self.assertEqual(calls, [("jp", "test-pre")])
         payload = json.loads(stdout.getvalue())
         self.assertFalse(payload["ok"])
+        self.assertEqual(payload["summary"], "1/2 hosts failed")
+        self.assertEqual(payload["failed_hosts"], ["jp"])
+        self.assertEqual(payload["first_failure"]["host"], "jp")
+        self.assertEqual(payload["first_failure"]["phase"], "precheck")
         self.assertEqual(payload["hosts"][0]["host"], "jp")
         self.assertFalse(payload["hosts"][0]["ok"])
         self.assertEqual([step["phase"] for step in payload["hosts"][0]["steps"]], ["precheck"])

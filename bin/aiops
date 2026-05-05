@@ -24,6 +24,8 @@ DEFAULT_TIMEOUT = 60
 DEFAULT_WAIT = 25
 DEFAULT_TAIL = 200
 MAX_POLL_EXTRA = 30
+AGENT_STREAM_INLINE_BYTES = 2048
+AGENT_STREAM_PREVIEW_BYTES = 1024
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:/-]{0,200}$")
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 STEP_EVENT_PREFIX = "__AIOPS_STEP_JSON__" + secrets.token_hex(8) + "__"
@@ -31,6 +33,7 @@ OUTPUT_RAW = "raw"
 OUTPUT_JSON = "json"
 OUTPUT_AGENT_JSON = "agent-json"
 OUTPUT_AGENT_FULL = "agent-full"
+OUTPUT_DECISION = "decision"
 
 
 @dataclass
@@ -242,7 +245,7 @@ def token_for(host: HostConfig, privilege: str) -> str:
 
 
 def print_json_object(payload: dict[str, Any]) -> None:
-    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    print(json.dumps(payload, ensure_ascii=False))
 
 
 def extract_agent_step_events(stdout: str) -> tuple[str, list[dict[str, int]]]:
@@ -282,7 +285,34 @@ def extract_agent_step_events(stdout: str) -> tuple[str, list[dict[str, int]]]:
 
 
 def is_agent_output_mode(mode: str) -> bool:
-    return mode in {OUTPUT_AGENT_JSON, OUTPUT_AGENT_FULL}
+    return mode in {OUTPUT_AGENT_JSON, OUTPUT_AGENT_FULL, OUTPUT_DECISION}
+
+
+def line_count(text: str) -> int:
+    if text == "":
+        return 0
+    return text.count("\n") if text.endswith("\n") else text.count("\n") + 1
+
+
+def stream_preview(text: str, max_bytes: int = AGENT_STREAM_PREVIEW_BYTES) -> str:
+    data = text.encode("utf-8")
+    if len(data) <= max_bytes:
+        return text
+    half = max(1, max_bytes // 2)
+    head = data[:half].decode("utf-8", errors="ignore").rstrip()
+    tail = data[-half:].decode("utf-8", errors="ignore").lstrip()
+    return f"{head}\n... omitted {len(data) - (half * 2)} bytes ...\n{tail}"
+
+
+def add_stream_projection(result: dict[str, Any], name: str, text: str, *, compact: bool) -> None:
+    if not compact or len(text.encode("utf-8")) <= AGENT_STREAM_INLINE_BYTES:
+        result[name] = text
+        return
+    result[f"{name}_preview"] = stream_preview(text)
+    result[f"{name}_bytes"] = len(text.encode("utf-8"))
+    result[f"{name}_lines"] = line_count(text)
+    result[f"{name}_agent_truncated"] = True
+    result.setdefault("next", "use --output agent-full or --raw if full output is needed")
 
 
 def agent_result_payload(host: HostConfig, payload: dict[str, Any], *, compact: bool = True) -> dict[str, Any]:
@@ -291,13 +321,14 @@ def agent_result_payload(host: HostConfig, payload: dict[str, Any], *, compact: 
     stdout, steps = extract_agent_step_events(payload.get("stdout") or "")
     ok = state == "succeeded" and exit_code == 0
     result = {
-        "schema": "aiops.cli.result.v1",
         "ok": ok,
+        "summary": "command succeeded" if ok else f"command exited with code {exit_code}",
         "host": host.name,
+        "schema": "aiops.cli.result.v2",
         "job_id": payload.get("job_id"),
         "duration_ms": payload.get("duration_ms", 0),
-        "stdout": stdout,
     }
+    add_stream_projection(result, "stdout", stdout, compact=compact)
     stderr = payload.get("stderr") or ""
     error = payload.get("error") or ""
     flags = {
@@ -313,7 +344,6 @@ def agent_result_payload(host: HostConfig, payload: dict[str, Any], *, compact: 
                 "state": state,
                 "exit_code": exit_code,
                 "timed_out": flags["timed_out"],
-                "stderr": stderr,
                 "stdout_truncated": flags["stdout_truncated"],
                 "stderr_truncated": flags["stderr_truncated"],
                 "stdout_log_truncated": flags["stdout_log_truncated"],
@@ -321,15 +351,19 @@ def agent_result_payload(host: HostConfig, payload: dict[str, Any], *, compact: 
                 "error": error,
             }
         )
+        result["stderr"] = stderr
     elif not ok:
         result.update(
             {
+                "code": "timed_out" if flags["timed_out"] else "command_failed",
+                "retryable": bool(flags["timed_out"]),
+                "next": "inspect stderr or rerun with --output agent-full",
                 "state": state,
                 "exit_code": exit_code,
-                "stderr": stderr,
                 "error": error,
             }
         )
+        add_stream_projection(result, "stderr", stderr, compact=compact)
         result.update(flags)
     else:
         if stderr:
@@ -342,6 +376,14 @@ def agent_result_payload(host: HostConfig, payload: dict[str, Any], *, compact: 
     if steps:
         result["steps"] = steps
     return result
+
+
+def decision_result_payload(host: HostConfig, payload: dict[str, Any]) -> dict[str, Any]:
+    result = agent_result_payload(host, payload)
+    allowed = {"ok", "summary", "host", "schema", "job_id", "duration_ms", "code", "next", "retryable"}
+    if not result.get("ok"):
+        allowed.update({"state", "exit_code", "error"})
+    return {key: value for key, value in result.items() if key in allowed}
 
 
 def error_output_mode(argv: list[str], env: dict[str, str] | None = None) -> str:
@@ -397,6 +439,77 @@ def agent_error_payload(host: str | None, exc: AiopsError) -> dict[str, Any]:
     }
 
 
+def result_failure_code(result: dict[str, Any]) -> str:
+    code = str(result.get("code") or "")
+    if code:
+        return code
+    if result.get("timed_out"):
+        return "timed_out"
+    return "command_failed"
+
+
+def fleet_counts(items: list[dict[str, Any]], *, total_count: int | None = None) -> dict[str, int]:
+    ok_count = sum(1 for item in items if item.get("ok") is True)
+    failed_count = sum(1 for item in items if item.get("ok") is not True)
+    total = total_count if total_count is not None else len(items)
+    counts = {"total": total, "ok": ok_count, "failed": failed_count}
+    skipped = total - len(items)
+    if skipped > 0:
+        counts["skipped"] = skipped
+    return counts
+
+
+def first_failure_summary(items: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for item in items:
+        if item.get("ok") is True:
+            continue
+        failed_step = None
+        for step in item.get("steps") or []:
+            if isinstance(step, dict) and step.get("ok") is not True:
+                failed_step = step
+                break
+        source = failed_step or item
+        failure = {
+            "host": item.get("host", ""),
+            "code": result_failure_code(source),
+            "summary": source.get("summary") or source.get("message") or "host failed",
+        }
+        if source.get("phase"):
+            failure["phase"] = source.get("phase")
+        return failure
+    return None
+
+
+def fleet_agent_payload(
+    schema: str,
+    items_key: str,
+    items: list[dict[str, Any]],
+    *,
+    success_word: str = "succeeded",
+    total_count: int | None = None,
+) -> dict[str, Any]:
+    counts = fleet_counts(items, total_count=total_count)
+    failed_hosts = [str(item.get("host", "")) for item in items if item.get("ok") is not True]
+    ok = counts["failed"] == 0
+    summary = (
+        f"{counts['ok']}/{counts['total']} hosts {success_word}"
+        if ok
+        else f"{counts['failed']}/{counts['total']} hosts failed"
+    )
+    payload: dict[str, Any] = {
+        "ok": ok,
+        "summary": summary,
+        "schema": schema,
+        "counts": counts,
+        "failed_hosts": failed_hosts,
+    }
+    failure = first_failure_summary(items)
+    if failure:
+        payload["first_failure"] = failure
+    payload[items_key] = items
+    return payload
+
+
 def run_remote(
     host: HostConfig,
     req: dict[str, Any],
@@ -419,7 +532,10 @@ def run_remote(
         return 0
 
     if is_agent_output_mode(mode):
-        print_json_object(agent_result_payload(host, payload, compact=mode != OUTPUT_AGENT_FULL))
+        if mode == OUTPUT_DECISION:
+            print_json_object(decision_result_payload(host, payload))
+        else:
+            print_json_object(agent_result_payload(host, payload, compact=mode != OUTPUT_AGENT_FULL))
     elif mode == OUTPUT_JSON:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
@@ -547,6 +663,7 @@ def add_output_options(parser: argparse.ArgumentParser) -> None:
         default="",
         help="select output profile; old --raw/--json/--agent-json flags remain supported",
     )
+    parser.add_argument("--view", choices=["decision", "brief", "full", "raw"], default="", help="agent-oriented output view alias")
     parser.add_argument("--raw", action="store_true", help="print raw stdout/stderr")
     parser.add_argument("--json", action="store_true", help="print the full result JSON")
     parser.add_argument("--agent-json", action="store_true", help="print a stable one-object JSON result for agents")
@@ -571,15 +688,24 @@ def parse_run(rest: list[str], host: HostConfig) -> int:
 
 
 def selected_output_mode(args: argparse.Namespace, host: HostConfig) -> str:
-    selected = int(bool(args.output)) + int(bool(args.raw)) + int(bool(args.json)) + int(bool(args.agent_json))
+    selected = int(bool(args.output)) + int(bool(args.view)) + int(bool(args.raw)) + int(bool(args.json)) + int(bool(args.agent_json))
     if selected > 1:
-        raise AiopsError("--output, --raw, --json, and --agent-json are mutually exclusive")
+        raise AiopsError("--output, --view, --raw, --json, and --agent-json are mutually exclusive")
     if args.output:
         if args.output in {"agent", "agent-json"}:
             return OUTPUT_AGENT_JSON
         if args.output == "agent-full":
             return OUTPUT_AGENT_FULL
         return args.output
+    if args.view:
+        if args.view == "decision":
+            return OUTPUT_DECISION
+        if args.view == "brief":
+            return OUTPUT_AGENT_JSON
+        if args.view == "full":
+            return OUTPUT_AGENT_FULL
+        if args.view == "raw":
+            return OUTPUT_RAW
     if args.raw:
         return OUTPUT_RAW
     if args.json:
@@ -726,7 +852,10 @@ def command_fleet(env: dict[str, str], rest: list[str]) -> int:
                 result = agent_job_payload(host, payload)
                 return 0, result
             if is_agent_output_mode(mode):
-                result = agent_result_payload(host, payload, compact=mode != OUTPUT_AGENT_FULL)
+                if mode == OUTPUT_DECISION:
+                    result = decision_result_payload(host, payload)
+                else:
+                    result = agent_result_payload(host, payload, compact=mode != OUTPUT_AGENT_FULL)
             elif mode == OUTPUT_JSON:
                 result = dict(payload)
                 result["host"] = host.name
@@ -772,13 +901,7 @@ def command_fleet(env: dict[str, str], rest: list[str]) -> int:
                 if not stderr.endswith("\n"):
                     sys.stderr.write("\n")
     else:
-        print_json_object(
-            {
-                "schema": "aiops.cli.fleet.v1",
-                "ok": return_code == 0,
-                "results": results,
-            }
-        )
+        print_json_object(fleet_agent_payload("aiops.cli.fleet.v2", "results", results))
     return return_code
 
 
@@ -886,7 +1009,15 @@ def command_fleet_plan(env: dict[str, str], rest: list[str]) -> int:
                     if not stderr.endswith("\n"):
                         sys.stderr.write("\n")
     else:
-        print_json_object({"schema": "aiops.cli.fleet_plan.v1", "ok": overall_ok, "hosts": host_results})
+        print_json_object(
+            fleet_agent_payload(
+                "aiops.cli.fleet_plan.v2",
+                "hosts",
+                host_results,
+                success_word="completed",
+                total_count=len(host_names),
+            )
+        )
     return return_code
 
 
@@ -1008,6 +1139,89 @@ def run_builtin(
     req = base_run_request(args, cmd, host)
     mode = output_mode or (OUTPUT_JSON if json_output else host.output_mode)
     return run_remote(host, req, follow=True, output_mode=mode)
+
+
+def extract_ports(text: str) -> list[int]:
+    ports = {int(match.group(1)) for match in re.finditer(r"(?<!\d)(\d{1,5})(?:/tcp|/udp)", text)}
+    return sorted(port for port in ports if 1 <= port <= 65535)
+
+
+def extract_listener_ports(text: str) -> list[int]:
+    ports = {int(match.group(1)) for match in re.finditer(r":(\d{1,5})\b", text)}
+    return sorted(port for port in ports if 1 <= port <= 65535)
+
+
+def ssh_surface_facts(stdout: str) -> dict[str, Any]:
+    effective = []
+    listening = []
+    allow = []
+    deny = []
+    section = ""
+    for line in stdout.splitlines():
+        if line.startswith("## "):
+            section = line[3:].strip()
+            continue
+        if section == "sshd effective ports":
+            m = re.match(r"port\s+(\d+)\b", line.strip())
+            if m:
+                effective.append(int(m.group(1)))
+        elif section == "ssh listeners":
+            listening.extend(extract_listener_ports(line))
+        elif section == "ufw ssh rules":
+            ports = extract_ports(line)
+            upper = line.upper()
+            if "ALLOW" in upper:
+                allow.extend(ports)
+            if "DENY" in upper:
+                deny.extend(ports)
+    facts = {
+        "effective_ports": sorted(set(effective)),
+        "listening_ports": sorted(set(listening)),
+        "ufw": {
+            "allow": sorted(set(allow)),
+            "deny": sorted(set(deny)),
+        },
+    }
+    target_ports = set(facts["effective_ports"] or facts["listening_ports"])
+    facts["risk"] = "low" if target_ports and target_ports <= set(facts["ufw"]["allow"]) else "review"
+    return facts
+
+
+def run_ops_recipe(host: HostConfig, recipe: str, cmd: str, *, timeout: int, output_mode: str) -> int:
+    if output_mode == OUTPUT_RAW:
+        return run_builtin(host, cmd, timeout=timeout, output_mode=output_mode)
+    class Args:
+        root = True
+        user = False
+        cwd = "/"
+        wait = DEFAULT_WAIT
+        kill_grace = 3
+        max_stdout_bytes = 262144
+        max_stderr_bytes = 262144
+        max_stdout_log_bytes = 1048576
+        max_stderr_log_bytes = 1048576
+        lock_key = ""
+        idempotency_key = ""
+
+    args = Args()
+    args.timeout = timeout
+    req = base_run_request(args, cmd, host)
+    payload = execute_remote(host, req, follow=True)
+    if output_mode == OUTPUT_DECISION:
+        result = decision_result_payload(host, payload)
+    else:
+        result = agent_result_payload(host, payload, compact=output_mode != OUTPUT_AGENT_FULL)
+    result["recipe"] = recipe
+    if recipe == "ssh-surface" and result.get("ok") and output_mode != OUTPUT_DECISION:
+        result["facts"] = ssh_surface_facts(payload.get("stdout") or "")
+        if output_mode != OUTPUT_AGENT_FULL:
+            result.pop("stdout", None)
+    print_json_object(result)
+    exit_code = int(payload.get("exit_code", 1))
+    state = payload.get("state", "failed")
+    if exit_code == 0 and state == "succeeded":
+        return 0
+    return exit_code if 1 <= exit_code <= 125 else 1
 
 
 def command_inspect(host: HostConfig, rest: list[str]) -> int:
@@ -1146,7 +1360,7 @@ ss -lntp 'sport = :22 or sport = :2222 or sport = :22022' || true
 echo '## ufw ssh rules'
 ufw status numbered | awk '/22\/tcp|2222\/tcp/ {print}' || true
 """
-        return run_builtin(host, cmd, timeout=30, output_mode=selected_output_mode(args, host))
+        return run_ops_recipe(host, recipe, cmd, timeout=30, output_mode=selected_output_mode(args, host))
     raise AiopsError(f"unsupported ops recipe: {recipe}")
 
 
@@ -1207,8 +1421,8 @@ def usage() -> str:
   aiops fleet-plan --hosts jp,la --precheck <cmd> --apply <cmd> --postcheck <cmd>
   aiops fleet [--hosts jp,la] [--parallel N] [--raw|--json|--agent-json|--output PROFILE] -- <cmd>
   aiops <host> health
-  aiops <host> [--root|--user] [--cwd DIR] [--timeout SEC] [--raw|--json|--agent-json|--output PROFILE] [--lock-key KEY] [--idempotency-key KEY] -- <cmd>
-  aiops <host> batch [--raw|--json|--agent-json|--output PROFILE] --cmd <cmd> [--cmd <cmd> ...]
+  aiops <host> [--root|--user] [--cwd DIR] [--timeout SEC] [--raw|--json|--agent-json|--output PROFILE|--view VIEW] [--lock-key KEY] [--idempotency-key KEY] -- <cmd>
+  aiops <host> batch [--raw|--json|--agent-json|--output PROFILE|--view VIEW] --cmd <cmd> [--cmd <cmd> ...]
   aiops <host> batch -- <cmd1> <cmd2> ...
   aiops <host> docker ps [--all]
   aiops <host> docker logs <container> [--tail N]

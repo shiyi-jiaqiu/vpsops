@@ -137,11 +137,15 @@ curl -sS 'http://127.0.0.1:7843/v1/jobs/JOB_ID/stdout?tail_bytes=65536' \
 
 ## Local CLI
 
-Use `vpsops` as the AI/operator CLI. It reads `.env` from this repo root, hides the HTTPS/token details, and calls the existing `/v1/run` API. The default command output is compact stable agent JSON; successful commands omit default-empty diagnostic fields to reduce agent tokens, while failures keep `state`, `exit_code`, `stderr`, truncation flags, and `error`.
+Use `vpsops` as the AI/operator CLI. It reads `.env` from this repo root, hides the HTTPS/token details, and calls the existing `/v1/run` API. The default command output is compact stable agent JSON; successful commands put `ok`, `summary`, `host`, and `schema` first, omit default-empty diagnostics, and summarize large streams with previews to reduce agent tokens. Failures keep decision fields plus `state`, `exit_code`, `stderr` or `stderr_preview`, truncation flags, and `error`.
 
 Output profiles:
 
-- Default / `--output agent`: compact `aiops.cli.result.v1` for agents.
+- Default / `--output agent`: compact `aiops.cli.result.v2` for agents.
+- `--view decision`: shortest decision envelope for agents that only need continue/stop state.
+- `--view brief`: alias for the default compact agent view.
+- `--view full`: alias for `--output agent-full`.
+- `--view raw`: alias for `--raw`.
 - `--output agent-full`: full agent envelope, including success diagnostics.
 - `--json`: raw daemon result JSON.
 - `--raw`: remote stdout/stderr bytes for scripts or direct human inspection.
@@ -151,6 +155,7 @@ cp .env.example .env
 vpsops hosts
 vpsops jp health
 vpsops jp -- hostname
+vpsops jp --view decision -- systemctl is-active caddy
 vpsops jp --raw -- hostname
 vpsops jp --user -- id -un
 vpsops jp batch --cmd 'hostname' --cmd 'uptime' --cmd 'df -h /'
@@ -190,11 +195,11 @@ vpsops <host> batch \
 
 `batch` runs commands sequentially inside one remote job. By default it continues after failed steps so diagnostics are not lost, but the final exit code is non-zero if any step failed. Use `--stop-on-error` for deployment/update sequences where later steps must not run after a failure. In default agent JSON mode, `batch` includes per-step status in `steps`.
 
-`fleet` runs one command across multiple configured hosts and emits one `aiops.cli.fleet.v1` object with per-host results. Use it for read-only fan-out checks; keep mutable fleet operations guarded with `--lock-key` and conservative `--parallel` values.
+`fleet` runs one command across multiple configured hosts and emits one `aiops.cli.fleet.v2` object with `summary`, `counts`, `failed_hosts`, optional `first_failure`, and per-host results. Use it for read-only fan-out checks; keep mutable fleet operations guarded with `--lock-key` and conservative `--parallel` values.
 
-`fleet-plan` runs a gated serial plan across hosts: all `--precheck` commands, then `--apply` commands under a shared lock key, then `--postcheck` commands. It stops on the first failed step and emits one `aiops.cli.fleet_plan.v1` object. Use it for small live changes where the order and failure behavior matter more than parallel speed.
+`fleet-plan` runs a gated serial plan across hosts: all `--precheck` commands, then `--apply` commands under a shared lock key, then `--postcheck` commands. It stops on the first failed step and emits one `aiops.cli.fleet_plan.v2` object with aggregate counts, skipped host count when applicable, and the first failed phase. Use it for small live changes where the order and failure behavior matter more than parallel speed.
 
-`doctor` runs the daemon deployment self-check on a host through `vpsops`, including the sudo/helper fd 3 probe by default. `ops ssh-surface` is a read-only recipe for checking effective SSH ports, listeners, and UFW SSH rules.
+`doctor` runs the daemon deployment self-check on a host through `vpsops`, including the sudo/helper fd 3 probe by default. `ops ssh-surface` is a read-only recipe for checking effective SSH ports, listeners, and UFW SSH rules; in agent mode it returns structured `facts` instead of forcing agents to parse `ss` and `ufw` text.
 
 `job cancel <job_id>` requests cancellation for a queued or running job. The daemon marks the job as `canceled` and cancels its execution context when the runner is active.
 
